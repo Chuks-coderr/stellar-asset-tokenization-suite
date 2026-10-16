@@ -3,7 +3,7 @@
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
     token::{StellarAssetClient, TokenClient},
-    Address, Env, InvokeError, Map, Symbol, Vec,
+    Address, BytesN, Env, InvokeError, Map, Symbol, Vec,
 };
 
 use crate::{
@@ -947,4 +947,92 @@ fn claim_all_portfolio_dividends_no_dividends_available() {
     // Token is registered and held, but no distributions exist yet
     let results = t.distributor.claim_all_portfolio_dividends(&claimer);
     assert_eq!(results.len(), 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issue #139: Emergency distribution freeze with governance override
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn single_owner(t: &TestEnv) -> Vec<Address> {
+    let mut owners = Vec::new(&t.env);
+    owners.push_back(t.admin.clone());
+    owners
+}
+
+#[test]
+fn freeze_blocks_new_distributions_and_claims() {
+    let t = setup();
+    let id = create_distribution(&t, &t.token.address);
+
+    t.distributor.freeze_all_distributions(&t.admin);
+    assert!(t.distributor.is_distributions_frozen());
+
+    // New distributions are blocked.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        create_distribution(&t, &t.token.address);
+    }));
+    assert!(res.is_err());
+
+    // Claims return `DistributionNotActive`.
+    let res = t.distributor.try_claim_dividend(&id, &t.admin);
+    assert!(res.is_err());
+
+    // Nothing is claimable while frozen.
+    assert_eq!(t.distributor.calculate_available_dividend(&id, &t.admin), 0);
+}
+
+#[test]
+fn freeze_by_non_admin_panics() {
+    let t = setup();
+    let attacker = Address::generate(&t.env);
+    let res = t.distributor.try_freeze_all_distributions(&attacker);
+    assert!(res.is_err());
+    assert!(!t.distributor.is_distributions_frozen());
+}
+
+#[test]
+fn governance_unfreeze_restores_claims() {
+    let t = setup();
+    t.distributor
+        .init_distribution_governance(&t.admin, &single_owner(&t), &1u32, &0u64);
+
+    let id = create_distribution(&t, &t.token.address);
+
+    t.distributor.freeze_all_distributions(&t.admin);
+    assert!(t.distributor.is_distributions_frozen());
+
+    let payload = BytesN::from_array(&t.env, &[7u8; 32]);
+    let pid = t
+        .distributor
+        .create_unfreeze_proposal(&t.admin, &payload);
+    t.distributor
+        .approve_distribution_proposal(&t.admin, &pid);
+
+    // Emergency proposals become executable after their review window.
+    advance_ledger(&t.env, 3601);
+
+    assert!(t
+        .distributor
+        .unfreeze_all_distributions(&t.admin, &pid, &payload));
+    assert!(!t.distributor.is_distributions_frozen());
+
+    // The pre-existing distribution is preserved and claimable again.
+    let claimed = t.distributor.claim_dividend(&id, &t.admin);
+    assert!(claimed > 0);
+}
+
+#[test]
+fn admin_direct_unfreeze_is_rejected() {
+    let t = setup();
+    t.distributor
+        .init_distribution_governance(&t.admin, &single_owner(&t), &1u32, &0u64);
+    t.distributor.freeze_all_distributions(&t.admin);
+
+    // No approved governance proposal exists, so a direct unfreeze is rejected.
+    let payload = BytesN::from_array(&t.env, &[3u8; 32]);
+    let res = t
+        .distributor
+        .try_unfreeze_all_distributions(&t.admin, &1u64, &payload);
+    assert!(res.is_err());
+    assert!(t.distributor.is_distributions_frozen());
 }
