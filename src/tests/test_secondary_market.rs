@@ -1125,6 +1125,11 @@ fn test_auto_pruning_expired_orders() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Issue #141: efficient order book with sorted data structure
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn order_book_sorts_bids_desc_and_asks_asc() {
 // Issue #140: market orders with slippage protection
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1135,6 +1140,95 @@ fn market_buy_fills_lowest_ask_completely() {
     let seller = Address::generate(&t.env);
     let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
     base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Bids placed out of order: 100, 120, 90.
+    t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &100i128, &50i128, &future_expiry(&t.env), &0i128,
+    );
+    let best_bid = t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &120i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+    t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &90i128, &30i128, &future_expiry(&t.env), &0i128,
+    );
+
+    // Asks placed out of order: 200, 150, 180.
+    t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &200i128, &20i128, &future_expiry(&t.env), &0i128,
+    );
+    let best_ask = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &150i128, &25i128, &future_expiry(&t.env), &0i128,
+    );
+    t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &180i128, &15i128, &future_expiry(&t.env), &0i128,
+    );
+
+    let book = t.market.get_order_book(&t.token.address);
+    let bid_prices: std::vec::Vec<i128> = book.bids.iter().map(|l| l.price).collect();
+    let ask_prices: std::vec::Vec<i128> = book.asks.iter().map(|l| l.price).collect();
+    assert_eq!(bid_prices, std::vec![120i128, 100, 90]);
+    assert_eq!(ask_prices, std::vec![150i128, 180, 200]);
+
+    // O(1) best-price lookup points at index 0 of each side.
+    assert_eq!(t.market.get_best_bid(&t.token.address).unwrap().order_id, best_bid);
+    assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, best_ask);
+}
+
+#[test]
+fn order_book_insertion_and_removal() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    verify_kyc(&t, &buyer);
+
+    let o1 = t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &100i128, &20i128, &future_expiry(&t.env), &0i128,
+    );
+    let o2 = t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &100i128, &30i128, &future_expiry(&t.env), &0i128,
+    );
+    let o3 = t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &110i128, &25i128, &future_expiry(&t.env), &0i128,
+    );
+
+    // Two orders at 100 aggregate into a single level (time-ordered).
+    let book = t.market.get_order_book(&t.token.address);
+    assert_eq!(book.bids.len(), 2);
+    assert_eq!(book.bids.get(0).unwrap().price, 110);
+    assert_eq!(book.bids.get(0).unwrap().total_amount, 25);
+    assert_eq!(book.bids.get(1).unwrap().price, 100);
+    assert_eq!(book.bids.get(1).unwrap().total_amount, 50);
+    assert_eq!(book.bids.get(1).unwrap().order_count, 2);
+
+    // Removing one order at a level keeps the level, updating its totals.
+    t.market.cancel_order(&buyer, &o1);
+    let book = t.market.get_order_book(&t.token.address);
+    assert_eq!(book.bids.get(1).unwrap().total_amount, 30);
+    assert_eq!(book.bids.get(1).unwrap().order_count, 1);
+
+    // Removing the last order at a level drops the level entirely.
+    t.market.cancel_order(&buyer, &o2);
+    t.market.cancel_order(&buyer, &o3);
+    let book = t.market.get_order_book(&t.token.address);
+    assert_eq!(book.bids.len(), 0);
+    assert!(t.market.get_best_bid(&t.token.address).is_none());
+}
+
+#[test]
+fn match_best_order_fills_top_of_book() {
     t.token.transfer(&t.admin, &seller, &500i128);
     verify_kyc(&t, &buyer);
     verify_kyc(&t, &seller);
@@ -1196,6 +1290,32 @@ fn market_sell_fills_highest_bid_first() {
     let seller = Address::generate(&t.env);
     let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
     base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Two asks: 150 and 200. The 150 ask is best.
+    let ask_lo = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &150i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+    let ask_hi = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &200i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+
+    let filled_id = t
+        .market
+        .match_best_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"));
+    assert_eq!(filled_id, ask_lo);
+
+    // Top of book advances to the 200 ask, and the buyer received 40 RWA.
+    assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, ask_hi);
+    assert_eq!(t.token.get_balance(&buyer).amount, 40);
+}
+
+#[test]
+fn match_best_order_respects_time_priority() {
     t.token.transfer(&t.admin, &seller, &500i128);
     verify_kyc(&t, &buyer);
     verify_kyc(&t, &seller);
@@ -1242,6 +1362,25 @@ fn market_buy_beyond_limit_price_rejected() {
     let seller = Address::generate(&t.env);
     let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
     base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Two asks at the same price: the earliest must be matched first.
+    let first = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &100i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+    let second = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &100i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+
+    let filled = t
+        .market
+        .match_best_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"));
+    assert_eq!(filled, first);
+    assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, second);
     t.token.transfer(&t.admin, &seller, &500i128);
     verify_kyc(&t, &buyer);
     verify_kyc(&t, &seller);
