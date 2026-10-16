@@ -87,6 +87,24 @@ fn future_expiry(env: &Env) -> u64 {
     env.ledger().timestamp() + 3600
 }
 
+/// Mark a participant as KYC-verified so the market's compliance gate passes
+/// for both placing and filling orders.
+fn verify_kyc(t: &TestEnv, user: &Address) {
+    t.compliance.update_kyc_status(
+        &t.admin,
+        user,
+        &KYCStatus {
+            is_verified: true,
+            verification_level: 2,
+            expiry_date: t.env.ledger().timestamp() + 10_000_000,
+            jurisdiction: Symbol::new(&t.env, "US"),
+            is_accredited: true,
+            risk_score: 1,
+            aml_flags: Vec::new(&t.env),
+        },
+    );
+}
+
 // ── initialize ───────────────────────────────────────────────────────────────
 
 #[test]
@@ -484,9 +502,9 @@ fn concurrent_fill_same_order_no_double_fill() {
     t.market.fill_order(&seller1, &order_id, &50i128);
 
     // Second seller tries to fill the same already-filled order — should panic
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.market.fill_order(&seller2, &order_id, &10i128);
-    });
+    }));
     assert!(result.is_err());
 
     // Verify no funds lost: buyer got exactly 50, not 60
@@ -514,9 +532,9 @@ fn concurrent_fill_exceeding_remaining_panics_no_double_spend() {
     t.market.fill_order(&seller1, &order_id, &40i128);
 
     // Second seller tries to fill 20 when only 10 remain — should panic
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.market.fill_order(&seller2, &order_id, &20i128);
-    });
+    }));
     assert!(result.is_err());
 
     // Verify no extra tokens moved: buyer got exactly 40
@@ -656,7 +674,7 @@ fn escrow_balances_correct_after_multiple_fills() {
     let market_base_before = t.base_token.balance(&t.market.address);
 
     // Place 3 buy orders
-    let ids: Vec<u64> = (0..3)
+    let ids: std::vec::Vec<u64> = (0..3)
         .map(|_| {
             t.market.place_order(
                 &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
@@ -866,9 +884,9 @@ fn no_double_fill_on_partially_filled_order() {
     assert_eq!(t.token.get_balance(&buyer).amount, 100);
 
     // Any further fill should panic
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.market.fill_order(&seller, &order_id, &1i128);
-    });
+    }));
     assert!(result.is_err());
 }
 
@@ -1104,4 +1122,161 @@ fn test_auto_pruning_expired_orders() {
 
     // Escrow should be refunded automatically
     assert_eq!(t.base_token.balance(&buyer), balance_before);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issue #141: efficient order book with sorted data structure
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn order_book_sorts_bids_desc_and_asks_asc() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Bids placed out of order: 100, 120, 90.
+    t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &100i128, &50i128, &future_expiry(&t.env), &0i128,
+    );
+    let best_bid = t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &120i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+    t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &90i128, &30i128, &future_expiry(&t.env), &0i128,
+    );
+
+    // Asks placed out of order: 200, 150, 180.
+    t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &200i128, &20i128, &future_expiry(&t.env), &0i128,
+    );
+    let best_ask = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &150i128, &25i128, &future_expiry(&t.env), &0i128,
+    );
+    t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &180i128, &15i128, &future_expiry(&t.env), &0i128,
+    );
+
+    let book = t.market.get_order_book(&t.token.address);
+    let bid_prices: std::vec::Vec<i128> = book.bids.iter().map(|l| l.price).collect();
+    let ask_prices: std::vec::Vec<i128> = book.asks.iter().map(|l| l.price).collect();
+    assert_eq!(bid_prices, std::vec![120i128, 100, 90]);
+    assert_eq!(ask_prices, std::vec![150i128, 180, 200]);
+
+    // O(1) best-price lookup points at index 0 of each side.
+    assert_eq!(t.market.get_best_bid(&t.token.address).unwrap().order_id, best_bid);
+    assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, best_ask);
+}
+
+#[test]
+fn order_book_insertion_and_removal() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    verify_kyc(&t, &buyer);
+
+    let o1 = t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &100i128, &20i128, &future_expiry(&t.env), &0i128,
+    );
+    let o2 = t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &100i128, &30i128, &future_expiry(&t.env), &0i128,
+    );
+    let o3 = t.market.place_order(
+        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &110i128, &25i128, &future_expiry(&t.env), &0i128,
+    );
+
+    // Two orders at 100 aggregate into a single level (time-ordered).
+    let book = t.market.get_order_book(&t.token.address);
+    assert_eq!(book.bids.len(), 2);
+    assert_eq!(book.bids.get(0).unwrap().price, 110);
+    assert_eq!(book.bids.get(0).unwrap().total_amount, 25);
+    assert_eq!(book.bids.get(1).unwrap().price, 100);
+    assert_eq!(book.bids.get(1).unwrap().total_amount, 50);
+    assert_eq!(book.bids.get(1).unwrap().order_count, 2);
+
+    // Removing one order at a level keeps the level, updating its totals.
+    t.market.cancel_order(&buyer, &o1);
+    let book = t.market.get_order_book(&t.token.address);
+    assert_eq!(book.bids.get(1).unwrap().total_amount, 30);
+    assert_eq!(book.bids.get(1).unwrap().order_count, 1);
+
+    // Removing the last order at a level drops the level entirely.
+    t.market.cancel_order(&buyer, &o2);
+    t.market.cancel_order(&buyer, &o3);
+    let book = t.market.get_order_book(&t.token.address);
+    assert_eq!(book.bids.len(), 0);
+    assert!(t.market.get_best_bid(&t.token.address).is_none());
+}
+
+#[test]
+fn match_best_order_fills_top_of_book() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Two asks: 150 and 200. The 150 ask is best.
+    let ask_lo = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &150i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+    let ask_hi = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &200i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+
+    let filled_id = t
+        .market
+        .match_best_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"));
+    assert_eq!(filled_id, ask_lo);
+
+    // Top of book advances to the 200 ask, and the buyer received 40 RWA.
+    assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, ask_hi);
+    assert_eq!(t.token.get_balance(&buyer).amount, 40);
+}
+
+#[test]
+fn match_best_order_respects_time_priority() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Two asks at the same price: the earliest must be matched first.
+    let first = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &100i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+    let second = t.market.place_order(
+        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &100i128, &40i128, &future_expiry(&t.env), &0i128,
+    );
+
+    let filled = t
+        .market
+        .match_best_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"));
+    assert_eq!(filled, first);
+    assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, second);
 }
