@@ -12,6 +12,10 @@ const STORAGE_VERSION: u32 = 1;
 /// Configurable per-deployment via `DividendConfig.min_claim_window`.
 pub const DEFAULT_MIN_CLAIM_WINDOW: u64 = 3600;
 
+/// Proposal key used by the governance committee to authorise lifting an
+/// emergency freeze (`freeze_all_distributions`). See issue #139.
+pub const UNFREEZE_PROPOSAL_KEY: &str = "unfreeze_distributions";
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum DividendError {
@@ -37,6 +41,9 @@ pub enum DividendError {
     InvalidParameters = 20,
     NoAccrualConfigured = 21,
     ClaimDeadlineTooSoon = 22,
+    // Issue #139: emergency freeze errors.
+    DistributionsFrozen = 23,
+    InvalidGovernanceProposal = 24,
 }
 
 #[contracttype]
@@ -167,6 +174,10 @@ impl DividendDistributor {
                 &Symbol::new(&env, "registered_tokens"),
                 &Vec::<Address>::new(&env),
             );
+        // Issue #139: no emergency freeze is active at deployment time.
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "distributions_frozen"), &false);
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "version"), &STORAGE_VERSION);
@@ -344,6 +355,11 @@ impl DividendDistributor {
 
         Self::check_version(&env);
 
+        // Issue #139: an active emergency freeze blocks new distributions.
+        if Self::is_frozen(&env) {
+            panic_with_error!(&env, DividendError::DistributionsFrozen);
+        }
+
         let config: DividendConfig = env
             .storage()
             .instance()
@@ -433,6 +449,11 @@ impl DividendDistributor {
 
     pub fn claim_dividend(env: Env, distribution_id: u64, claimer: Address) -> i128 {
         Self::check_version(&env);
+
+        // Issue #139: claims are disabled while an emergency freeze is active.
+        if Self::is_frozen(&env) {
+            panic_with_error!(&env, DividendError::DistributionNotActive);
+        }
 
         let distributions: Vec<DividendDistribution> = env
             .storage()
@@ -532,6 +553,11 @@ impl DividendDistributor {
     }
 
     pub fn claim_all_dividends(env: Env, claimer: Address) -> Vec<i128> {
+        // Issue #139: no claims while frozen.
+        if Self::is_frozen(&env) {
+            return Vec::new(&env);
+        }
+
         let distributions: Vec<DividendDistribution> = env
             .storage()
             .instance()
@@ -571,6 +597,11 @@ impl DividendDistributor {
     pub fn claim_all_portfolio_dividends(env: Env, claimer: Address) -> Vec<(Address, i128)> {
         Self::check_version(&env);
 
+        // Issue #139: no claims while frozen.
+        if Self::is_frozen(&env) {
+            return Vec::new(&env);
+        }
+
         let tokens: Vec<Address> = env
             .storage()
             .instance()
@@ -605,6 +636,11 @@ impl DividendDistributor {
     }
 
     fn claim_all_for_token(env: Env, claimer: Address, token_address: Address) -> i128 {
+        // Issue #139: no claims while frozen.
+        if Self::is_frozen(&env) {
+            return 0;
+        }
+
         let distributions: Vec<DividendDistribution> = env
             .storage()
             .instance()
@@ -690,6 +726,11 @@ impl DividendDistributor {
     }
 
     pub fn calculate_available_dividend(env: Env, distribution_id: u64, claimer: Address) -> i128 {
+        // Issue #139: nothing is claimable while frozen.
+        if Self::is_frozen(&env) {
+            return 0;
+        }
+
         let distributions: Vec<DividendDistribution> = env
             .storage()
             .instance()
@@ -1007,6 +1048,137 @@ impl DividendDistributor {
                 .instance()
                 .set(&Symbol::new(&env, "distributions"), &new_distributions);
         }
+    }
+
+    // ── Issue #139: emergency freeze & governance-gated unfreeze ──────────
+
+    /// Whether an emergency freeze is currently active. Defaults to `false`.
+    pub fn is_distributions_frozen(env: Env) -> bool {
+        Self::is_frozen(&env)
+    }
+
+    fn is_frozen(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(env, "distributions_frozen"))
+            .unwrap_or(false)
+    }
+
+    /// Emergency halt. Stops both new distributions and all claims until a
+    /// governance proposal lifts the freeze. Admin-only.
+    ///
+    /// Existing distributions and already-accrued balances are left untouched
+    /// and become claimable again once the freeze is lifted.
+    pub fn freeze_all_distributions(env: Env, auth: Address) {
+        crate::shared_admin::require_admin(&env, &auth);
+        Self::check_version(&env);
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "distributions_frozen"), &true);
+
+        env.events().publish(
+            (Symbol::new(&env, "distributions_frozen"), auth),
+            (env.ledger().timestamp(),),
+        );
+    }
+
+    /// Configure the governance committee that must approve an unfreeze.
+    ///
+    /// Mirrors the shared governance module: `owners` are the eligible
+    /// approvers, `threshold` the number of unique approvals required and
+    /// `timelock_seconds` the delay before a proposal becomes executable.
+    pub fn init_distribution_governance(
+        env: Env,
+        auth: Address,
+        owners: Vec<Address>,
+        threshold: u32,
+        timelock_seconds: u64,
+    ) {
+        // Verify the caller is the contract admin *without* calling
+        // `require_auth` here: `write_governance` performs the single auth
+        // requirement for this frame.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "admin"))
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::NotInitialized));
+        if auth != admin {
+            panic_with_error!(&env, DividendError::Unauthorized);
+        }
+
+        crate::shared_governance::write_governance(
+            &env,
+            &auth,
+            &owners,
+            threshold,
+            timelock_seconds,
+        );
+    }
+
+    /// Create an emergency governance proposal authorising an unfreeze.
+    ///
+    /// Once it has been approved by the committee and passes its review
+    /// window, call `unfreeze_all_distributions` with the returned id and the
+    /// same `payload_hash`. Exposed as `create_unfreeze_proposal` because
+    /// Soroban caps exported function names at 32 characters.
+    pub fn create_unfreeze_proposal(
+        env: Env,
+        proposer: Address,
+        payload_hash: soroban_sdk::BytesN<32>,
+    ) -> u64 {
+        let proposal_key = Symbol::new(&env, UNFREEZE_PROPOSAL_KEY);
+        crate::shared_governance::create_emergency_proposal(
+            env,
+            proposer,
+            proposal_key,
+            payload_hash,
+        )
+    }
+
+    /// Approve a pending governance proposal (must be a committee owner).
+    pub fn approve_distribution_proposal(env: Env, approver: Address, proposal_id: u64) {
+        crate::shared_governance::approve(env, approver, proposal_id);
+    }
+
+    /// Lift an emergency freeze.
+    ///
+    /// This deliberately does **not** accept a plain admin call: the caller
+    /// must supply an approved and executable governance proposal. A direct
+    /// admin call (or one pointing at a non-approved proposal) is rejected.
+    pub fn unfreeze_all_distributions(
+        env: Env,
+        executor: Address,
+        proposal_id: u64,
+        payload_hash: soroban_sdk::BytesN<32>,
+    ) -> bool {
+        if !Self::is_frozen(&env) {
+            panic_with_error!(&env, DividendError::InvalidParameters);
+        }
+
+        let proposal_key = Symbol::new(&env, UNFREEZE_PROPOSAL_KEY);
+        if !crate::shared_governance::can_execute(
+            &env,
+            proposal_id,
+            proposal_key,
+            payload_hash,
+        ) {
+            panic_with_error!(&env, DividendError::InvalidGovernanceProposal);
+        }
+
+        // Mark the proposal executed (also re-checks vetos / auth).
+        crate::shared_governance::execute_mark(env.clone(), executor.clone(), proposal_id);
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "distributions_frozen"), &false);
+
+        env.events().publish(
+            (Symbol::new(&env, "distributions_unfrozen"), executor),
+            (proposal_id, env.ledger().timestamp()),
+        );
+
+        true
     }
 
     fn get_currency_token_address(env: Env, currency: Symbol) -> Address {
