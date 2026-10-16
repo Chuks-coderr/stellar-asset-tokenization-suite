@@ -28,6 +28,8 @@ pub enum MarketError {
     MarketNotInitialized = 14,
     AlreadyAtLatestVersion = 15,
     InvalidParameters = 16,
+    // Issue #140: market orders.
+    SlippageExceeded = 17,
 }
 
 #[contracttype]
@@ -314,51 +316,235 @@ impl SecondaryMarket {
             panic_with_error!(&env, MarketError::MinOrderSizeNotMet);
         }
 
-        // Settlement
+        // Settlement & state update
+        Self::settle_fill(&env, &taker, &mut order, fill_amount, &config);
+    }
+
+    /// Settle `fill_amount` against a resting `order` and persist the updated
+    /// order (issue #140 refactor: shared by `fill_order` and
+    /// `place_market_order`). Assumes all auth / limit / state checks have
+    /// already been performed by the caller.
+    fn settle_fill(
+        env: &Env,
+        taker: &Address,
+        order: &mut Order,
+        fill_amount: i128,
+        config: &MarketConfig,
+    ) {
+        let order_id = order.id;
+
         let settlement_value = fill_amount * order.price;
         let fee = (settlement_value * config.fee_rate_bps as i128) / 10000;
         let net_value = settlement_value - fee;
 
-        let base_token = TokenClient::new(&env, &config.base_currency);
-        let rwa_token = RWATokenClient::new(&env, &order.token_address);
+        let base_token = TokenClient::new(env, &config.base_currency);
+        let rwa_token = RWATokenClient::new(env, &order.token_address);
 
-        if order.side == Symbol::new(&env, "buy") {
-            // Maker was buyer (escrowed payment), Taker is seller
-            // Transfer RWA from Taker to Maker
-            rwa_token.transfer(&taker, &order.maker, &fill_amount);
-            // Transfer payment from Escrow to Taker
-            base_token.transfer(&env.current_contract_address(), &taker, &net_value);
+        if order.side == Symbol::new(env, "buy") {
+            // Maker was buyer (escrowed payment), taker is seller.
+            rwa_token.transfer(taker, &order.maker, &fill_amount);
+            base_token.transfer(&env.current_contract_address(), taker, &net_value);
         } else {
-            // Maker was seller (escrowed tokens), Taker is buyer
-            // Transfer RWA from Escrow to Taker
-            rwa_token.transfer(&env.current_contract_address(), &taker, &fill_amount);
-            // Transfer payment from Taker to Maker
-            base_token.transfer(&taker, &order.maker, &net_value);
+            // Maker was seller (escrowed tokens), taker is buyer.
+            rwa_token.transfer(&env.current_contract_address(), taker, &fill_amount);
+            base_token.transfer(taker, &order.maker, &net_value);
         }
 
-        // Transfer fee
         if fee > 0 {
-            if order.side == Symbol::new(&env, "buy") {
+            if order.side == Symbol::new(env, "buy") {
                 base_token.transfer(&env.current_contract_address(), &config.fee_recipient, &fee);
             } else {
-                base_token.transfer(&taker, &config.fee_recipient, &fee);
+                base_token.transfer(taker, &config.fee_recipient, &fee);
             }
         }
 
-        // Update Order
         order.filled_amount += fill_amount;
         if order.filled_amount == order.amount {
             order.is_active = false;
         }
-        env.storage().temporary().set(&DataKey::Order(order_id), &order);
+        env.storage().temporary().set(&DataKey::Order(order_id), order);
 
-        // Record Trade & Update VWAP/TWAP
-        Self::handle_trade_data(&env, order.token_address.clone(), fill_amount, order.price);
+        Self::handle_trade_data(env, order.token_address.clone(), fill_amount, order.price);
 
         env.events().publish(
-            (Symbol::new(&env, "trade"), order.token_address),
-            (order_id, taker, fill_amount, order.price, env.ledger().timestamp()),
+            (Symbol::new(env, "trade"), order.token_address.clone()),
+            (order_id, taker.clone(), fill_amount, order.price, env.ledger().timestamp()),
         );
+    }
+
+    /// Best active resting order on one side of the book, ranked by price then
+    /// arrival time (issue #140 scan-based helper).
+    fn best_opposing_order(env: &Env, token_address: &Address, resting_is_bid: bool) -> Option<Order> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OrderCount)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let want_side = if resting_is_bid {
+            Symbol::new(env, "buy")
+        } else {
+            Symbol::new(env, "sell")
+        };
+
+        let mut best: Option<Order> = None;
+        for id in 1..=count {
+            if let Some(order) = env
+                .storage()
+                .temporary()
+                .get::<DataKey, Order>(&DataKey::Order(id))
+            {
+                if !order.is_active
+                    || order.expires_at <= now
+                    || order.token_address != *token_address
+                    || order.side != want_side
+                {
+                    continue;
+                }
+
+                let better = match &best {
+                    None => true,
+                    Some(b) => {
+                        if order.price != b.price {
+                            if resting_is_bid {
+                                order.price > b.price
+                            } else {
+                                order.price < b.price
+                            }
+                        } else if order.created_at != b.created_at {
+                            order.created_at < b.created_at
+                        } else {
+                            order.id < b.id
+                        }
+                    }
+                };
+                if better {
+                    best = Some(order);
+                }
+            }
+        }
+        best
+    }
+
+    /// Execute a market order immediately against the best available resting
+    /// orders (issue #140).
+    ///
+    /// A market buy fills the lowest-priced sells first; a market sell fills
+    /// the highest-priced buys first. `limit_price` is the slippage bound: the
+    /// worst price the taker is willing to accept (max for buys, min for
+    /// sells). Partial fills are allowed and any unfilled remainder is simply
+    /// left unexecuted — the taker never locks funds for a market order.
+    ///
+    /// Returns the total amount that was filled.
+    pub fn place_market_order(
+        env: Env,
+        taker: Address,
+        token_address: Address,
+        side: Symbol,
+        amount: i128,
+        limit_price: i128,
+    ) -> i128 {
+        taker.require_auth();
+
+        Self::check_version(&env);
+
+        let config: MarketConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketError::MarketNotInitialized));
+        if config.is_paused {
+            panic_with_error!(&env, MarketError::TradingPaused);
+        }
+
+        Self::check_trading_halt(&env, &config, &token_address);
+        Self::check_compliance(&env, &config, &taker, &token_address);
+
+        let is_buy = side == Symbol::new(&env, "buy");
+        let is_sell = side == Symbol::new(&env, "sell");
+        if !is_buy && !is_sell {
+            panic_with_error!(&env, MarketError::InvalidOrder);
+        }
+        if amount < config.min_order_size {
+            panic_with_error!(&env, MarketError::MinOrderSizeNotMet);
+        }
+        if limit_price <= 0 {
+            panic_with_error!(&env, MarketError::InvalidParameters);
+        }
+
+        // The taker matches the opposite side of the book.
+        let resting_is_bid = is_sell;
+
+        env.events().publish(
+            (Symbol::new(&env, "market_order_placed"), token_address.clone()),
+            (
+                taker.clone(),
+                side.clone(),
+                amount,
+                limit_price,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        // Slippage protection: reject when the best available price is already
+        // outside the taker's limit.
+        let best = match Self::best_opposing_order(&env, &token_address, resting_is_bid) {
+            Some(order) => order,
+            None => panic_with_error!(&env, MarketError::InsufficientLiquidity),
+        };
+        let best_ok = if is_buy {
+            best.price <= limit_price
+        } else {
+            best.price >= limit_price
+        };
+        if !best_ok {
+            panic_with_error!(&env, MarketError::SlippageExceeded);
+        }
+
+        let mut remaining = amount;
+        let mut filled_total: i128 = 0;
+
+        while remaining > 0 {
+            let mut order = match Self::best_opposing_order(&env, &token_address, resting_is_bid) {
+                Some(order) => order,
+                None => break,
+            };
+
+            let within_limit = if is_buy {
+                order.price <= limit_price
+            } else {
+                order.price >= limit_price
+            };
+            if !within_limit {
+                break;
+            }
+
+            let available = order.amount - order.filled_amount;
+            if available <= 0 {
+                break;
+            }
+            let fill = if available < remaining {
+                available
+            } else {
+                remaining
+            };
+
+            Self::settle_fill(&env, &taker, &mut order, fill, &config);
+
+            env.events().publish(
+                (Symbol::new(&env, "market_order_filled"), token_address.clone()),
+                (order.id, fill, order.price, env.ledger().timestamp()),
+            );
+
+            remaining -= fill;
+            filled_total += fill;
+        }
+
+        if filled_total == 0 {
+            panic_with_error!(&env, MarketError::InsufficientLiquidity);
+        }
+
+        filled_total
     }
 
     pub fn cancel_order(env: Env, maker: Address, order_id: u64) {
@@ -517,7 +703,7 @@ impl SecondaryMarket {
 
     fn check_compliance(env: &Env, config: &MarketConfig, user: &Address, token: &Address) {
         let registry = ComplianceRegistryClient::new(env, &config.compliance_registry);
-        let kyc = registry.get_kyc_status(user.clone());
+        let kyc = registry.get_kyc_status(user);
         if !kyc.is_verified {
             panic_with_error!(env, MarketError::ComplianceFailed);
         }
