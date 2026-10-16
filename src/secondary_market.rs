@@ -9,6 +9,9 @@ use crate::compliance_registry::ComplianceRegistryClient;
 
 const STORAGE_VERSION: u32 = 1;
 
+/// Issue #142: maximum live conditional orders per user and token.
+const MAX_CONDITIONAL_ORDERS_PER_USER: u32 = 50;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum MarketError {
@@ -28,6 +31,9 @@ pub enum MarketError {
     MarketNotInitialized = 14,
     AlreadyAtLatestVersion = 15,
     InvalidParameters = 16,
+    // Issue #142: conditional orders.
+    ConditionalOrderLimitReached = 18,
+    ConditionalOrderNotFound = 19,
 }
 
 #[contracttype]
@@ -85,6 +91,34 @@ pub struct BookOrder {
     pub price: i128,
     pub remaining: i128,
     pub created_at: u64,
+/// Trigger condition for a stop-loss / take-profit order (issue #142).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OrderCondition {
+    None,
+    /// Triggers when the last traded price falls to or below the threshold.
+    StopLoss(i128),
+    /// Triggers when the last traded price rises to or above the threshold.
+    TakeProfit(i128),
+}
+
+/// An off-book order held until its trigger condition is met (issue #142).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ConditionalOrder {
+    pub id: u64,
+    pub owner: Address,
+    pub token_address: Address,
+    pub side: Symbol,
+    pub price: i128,
+    pub amount: i128,
+    pub filled_amount: i128,
+    pub condition: OrderCondition,
+    pub expires_at: u64,
+    pub created_at: u64,
+    pub is_active: bool,
+    /// The resting order id created when the condition triggered (0 otherwise).
+    pub activated_order_id: u64,
 }
 
 #[contracttype]
@@ -115,6 +149,11 @@ pub enum DataKey {
     AskPrices(Address),          // Vec<i128>, ascending
     BidOrders(Address, i128),    // Vec<u64> order ids at a bid price level
     AskOrders(Address, i128),    // Vec<u64> order ids at an ask price level
+    // Issue #142: conditional orders.
+    LastPrice(Address),                     // last traded price for a token
+    ConditionalCount,                       // u64 number of conditional orders
+    ConditionalOrder(u64),                  // ConditionalOrder by id
+    UserConditionalCount(Address, Address), // (owner, token) -> u32 active count
 }
 
 // ... (around line 80)
@@ -399,6 +438,9 @@ impl SecondaryMarket {
         // Record Trade & Update VWAP/TWAP
         Self::handle_trade_data(&env, order.token_address.clone(), fill_amount, order.price);
 
+        // Issue #142: evaluate conditional orders after every trade execution.
+        Self::evaluate_conditional_orders(env.clone(), order.token_address.clone());
+
         env.events().publish(
             (Symbol::new(&env, "trade"), order.token_address),
             (order_id, taker, fill_amount, order.price, env.ledger().timestamp()),
@@ -496,6 +538,11 @@ impl SecondaryMarket {
         env.storage().instance().set(&DataKey::TradeCount, &trade_count);
 
         let now = env.ledger().timestamp();
+
+        // Issue #142: remember the last traded price for trigger evaluation.
+        env.storage()
+            .persistent()
+            .set(&DataKey::LastPrice(token.clone()), &price);
 
         // 1. Update VWAP (Volume Weighted Average Price)
         // Store as (total_volume, total_value)
@@ -787,6 +834,296 @@ impl SecondaryMarket {
         // `fill_order` performs the single authorisation and settlement.
         Self::fill_order(env, taker, best, remaining);
         best
+    // ── Issue #142: stop-loss / take-profit conditional orders ────────────
+
+    fn read_last_price(env: &Env, token: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LastPrice(token.clone()))
+            .unwrap_or(0)
+    }
+
+    fn user_conditional_key(owner: &Address, token: &Address) -> DataKey {
+        DataKey::UserConditionalCount(owner.clone(), token.clone())
+    }
+
+    /// Place an off-book conditional (stop-loss / take-profit) order.
+    ///
+    /// Funds are escrowed immediately so the order can be converted into a
+    /// resting limit order when it triggers without needing the owner's
+    /// signature again. At most `MAX_CONDITIONAL_ORDERS_PER_USER` conditional
+    /// orders may be live per user and token.
+    pub fn place_conditional_order(
+        env: Env,
+        owner: Address,
+        token_address: Address,
+        side: Symbol,
+        price: i128,
+        amount: i128,
+        condition: OrderCondition,
+        expiry: u64,
+    ) -> u64 {
+        owner.require_auth();
+        Self::check_version(&env);
+
+        let config: MarketConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketError::MarketNotInitialized));
+        if config.is_paused {
+            panic_with_error!(&env, MarketError::TradingPaused);
+        }
+
+        Self::check_trading_halt(&env, &config, &token_address);
+        Self::check_compliance(&env, &config, &owner, &token_address);
+
+        if condition == OrderCondition::None {
+            panic_with_error!(&env, MarketError::InvalidOrder);
+        }
+        if amount < config.min_order_size || price <= 0 {
+            panic_with_error!(&env, MarketError::InvalidParameters);
+        }
+        if expiry <= env.ledger().timestamp() {
+            panic_with_error!(&env, MarketError::OrderExpired);
+        }
+
+        let is_buy = side == Symbol::new(&env, "buy");
+        let is_sell = side == Symbol::new(&env, "sell");
+        if !is_buy && !is_sell {
+            panic_with_error!(&env, MarketError::InvalidOrder);
+        }
+
+        // Per-user, per-token limit.
+        let user_key = Self::user_conditional_key(&owner, &token_address);
+        let live: u32 = env.storage().instance().get(&user_key).unwrap_or(0);
+        if live >= MAX_CONDITIONAL_ORDERS_PER_USER {
+            panic_with_error!(&env, MarketError::ConditionalOrderLimitReached);
+        }
+
+        // Escrow so the order can be activated later without the owner.
+        if is_buy {
+            let total_cost = amount * price;
+            let base_token = TokenClient::new(&env, &config.base_currency);
+            base_token.transfer(&owner, &env.current_contract_address(), &total_cost);
+        } else {
+            let rwa_token = RWATokenClient::new(&env, &token_address);
+            rwa_token.transfer(&owner, &env.current_contract_address(), &amount);
+        }
+
+        let mut count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConditionalCount)
+            .unwrap_or(0);
+        count += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ConditionalCount, &count);
+
+        let cond = ConditionalOrder {
+            id: count,
+            owner: owner.clone(),
+            token_address: token_address.clone(),
+            side: side.clone(),
+            price,
+            amount,
+            filled_amount: 0,
+            condition,
+            expires_at: expiry,
+            created_at: env.ledger().timestamp(),
+            is_active: true,
+            activated_order_id: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::ConditionalOrder(count), &cond);
+        env.storage().instance().set(&user_key, &(live + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "conditional_order_placed"), token_address),
+            (count, owner, side, price, amount, env.ledger().timestamp()),
+        );
+
+        count
+    }
+
+    /// Read a conditional order by id.
+    pub fn get_conditional_order(env: Env, id: u64) -> ConditionalOrder {
+        env.storage()
+            .instance()
+            .get(&DataKey::ConditionalOrder(id))
+            .unwrap_or_else(|| panic_with_error!(&env, MarketError::ConditionalOrderNotFound))
+    }
+
+    /// Cancel a live conditional order and refund its escrow to the owner.
+    pub fn cancel_conditional_order(env: Env, owner: Address, id: u64) {
+        owner.require_auth();
+        Self::check_version(&env);
+
+        let mut cond: ConditionalOrder = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConditionalOrder(id))
+            .unwrap_or_else(|| panic_with_error!(&env, MarketError::ConditionalOrderNotFound));
+
+        if cond.owner != owner {
+            panic_with_error!(&env, MarketError::Unauthorized);
+        }
+        if !cond.is_active {
+            panic_with_error!(&env, MarketError::InvalidOrder);
+        }
+
+        let config = Self::read_config(&env);
+        Self::refund_conditional(&env, &config, &cond);
+        cond.is_active = false;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ConditionalOrder(id), &cond);
+        Self::decrement_user_conditional(&env, &cond.owner, &cond.token_address);
+    }
+
+    /// Evaluate every live conditional order for `token_address` against the
+    /// last traded price. Called automatically after each trade.
+    pub fn evaluate_conditional_orders(env: Env, token_address: Address) {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConditionalCount)
+            .unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+
+        let last_price = Self::read_last_price(&env, &token_address);
+        let now = env.ledger().timestamp();
+        let config = Self::read_config(&env);
+
+        for id in 1..=count {
+            let mut cond: ConditionalOrder = match env
+                .storage()
+                .instance()
+                .get(&DataKey::ConditionalOrder(id))
+            {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if !cond.is_active || cond.token_address != token_address {
+                continue;
+            }
+
+            // Expiry is enforced independently of the traded price.
+            if cond.expires_at <= now {
+                cond.is_active = false;
+                Self::refund_conditional(&env, &config, &cond);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::ConditionalOrder(id), &cond);
+                Self::decrement_user_conditional(&env, &cond.owner, &cond.token_address);
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "conditional_order_expired"),
+                        cond.token_address.clone(),
+                    ),
+                    (id, cond.owner.clone(), now),
+                );
+                continue;
+            }
+
+            if last_price == 0 {
+                continue;
+            }
+
+            let triggered = match &cond.condition {
+                OrderCondition::StopLoss(trigger) => last_price <= *trigger,
+                OrderCondition::TakeProfit(trigger) => last_price >= *trigger,
+                OrderCondition::None => false,
+            };
+            if !triggered {
+                continue;
+            }
+
+            // Convert into a resting order (funds are already escrowed).
+            cond.activated_order_id = Self::activate_conditional_order(&env, &cond);
+            cond.is_active = false;
+            env.storage()
+                .instance()
+                .set(&DataKey::ConditionalOrder(id), &cond);
+            Self::decrement_user_conditional(&env, &cond.owner, &cond.token_address);
+        }
+    }
+
+    fn refund_conditional(env: &Env, config: &MarketConfig, cond: &ConditionalOrder) {
+        let remaining = cond.amount - cond.filled_amount;
+        if remaining <= 0 {
+            return;
+        }
+        if cond.side == Symbol::new(env, "buy") {
+            let refund = remaining * cond.price;
+            let base_token = TokenClient::new(env, &config.base_currency);
+            base_token.transfer(&env.current_contract_address(), &cond.owner, &refund);
+        } else {
+            let rwa_token = RWATokenClient::new(env, &cond.token_address);
+            rwa_token.transfer(&env.current_contract_address(), &cond.owner, &remaining);
+        }
+    }
+
+    fn activate_conditional_order(env: &Env, cond: &ConditionalOrder) -> u64 {
+        let mut count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OrderCount)
+            .unwrap_or(0);
+        count += 1;
+        env.storage().instance().set(&DataKey::OrderCount, &count);
+
+        let order = Order {
+            id: count,
+            maker: cond.owner.clone(),
+            token_address: cond.token_address.clone(),
+            side: cond.side.clone(),
+            price: cond.price,
+            amount: cond.amount,
+            filled_amount: cond.filled_amount,
+            min_fill: 0,
+            expires_at: cond.expires_at,
+            created_at: env.ledger().timestamp(),
+            is_active: true,
+        };
+        env.storage()
+            .temporary()
+            .set(&DataKey::Order(count), &order);
+
+        env.events().publish(
+            (
+                Symbol::new(env, "conditional_order_triggered"),
+                cond.token_address.clone(),
+            ),
+            (cond.id, count, cond.price, env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (Symbol::new(env, "order_placed"), cond.token_address.clone()),
+            (
+                count,
+                cond.owner.clone(),
+                cond.side.clone(),
+                cond.price,
+                cond.amount,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        count
+    }
+
+    fn decrement_user_conditional(env: &Env, owner: &Address, token: &Address) {
+        let key = Self::user_conditional_key(owner, token);
+        let live: u32 = env.storage().instance().get(&key).unwrap_or(0);
+        if live > 0 {
+            env.storage().instance().set(&key, &(live - 1));
+        }
     }
 
     // --- Private Logics ---

@@ -10,7 +10,7 @@ use crate::{
     compliance_registry::{ComplianceRegistry, ComplianceRegistryClient, KYCStatus},
     dividend_distributor::{DividendDistributor, DividendDistributorClient},
     rwa_token::{RWAToken, RWATokenClient},
-    secondary_market::{MarketError, SecondaryMarket, SecondaryMarketClient},
+    secondary_market::{MarketError, OrderCondition, SecondaryMarket, SecondaryMarketClient},
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1279,4 +1279,175 @@ fn match_best_order_respects_time_priority() {
         .match_best_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"));
     assert_eq!(filled, first);
     assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, second);
+// Issue #142: stop-loss and take-profit conditional orders
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn stop_loss_triggers_on_price_drop() {
+    let t = setup();
+    let owner = Address::generate(&t.env);
+    let trader = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&trader, &1_000_000i128);
+    t.token.transfer(&t.admin, &owner, &500i128);
+    t.token.transfer(&t.admin, &seller, &500i128);
+    verify_kyc(&t, &owner);
+    verify_kyc(&t, &trader);
+    verify_kyc(&t, &seller);
+
+    let rwa_before = t.token.get_balance(&owner).amount;
+    let cond_id = t.market.place_conditional_order(
+        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &75i128, &50i128,
+        &OrderCondition::StopLoss(80i128),
+        &future_expiry(&t.env),
+    );
+
+    // Escrowed immediately and kept off the book until triggered.
+    assert_eq!(t.token.get_balance(&owner).amount, rwa_before - 50);
+    let cond = t.market.get_conditional_order(&cond_id);
+    assert!(cond.is_active);
+    assert_eq!(cond.activated_order_id, 0);
+
+    // A trade at 80 crosses the stop-loss trigger.
+    let buy_id = t.market.place_order(
+        &trader, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &80i128, &50i128, &future_expiry(&t.env), &0i128,
+    );
+    t.market.fill_order(&seller, &buy_id, &50i128);
+
+    // Triggered → converted into a resting limit order.
+    let cond = t.market.get_conditional_order(&cond_id);
+    assert!(!cond.is_active);
+    assert!(cond.activated_order_id > 0);
+
+    // The activated order rests on the book and can be filled normally.
+    let buyer = Address::generate(&t.env);
+    base_admin.mint(&buyer, &1_000_000i128);
+    verify_kyc(&t, &buyer);
+    t.market.fill_order(&buyer, &cond.activated_order_id, &50i128);
+    assert_eq!(t.token.get_balance(&buyer).amount, 50);
+}
+
+#[test]
+fn take_profit_triggers_on_price_rise() {
+    let t = setup();
+    let owner = Address::generate(&t.env);
+    let trader = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&trader, &1_000_000i128);
+    t.token.transfer(&t.admin, &owner, &500i128);
+    t.token.transfer(&t.admin, &seller, &500i128);
+    verify_kyc(&t, &owner);
+    verify_kyc(&t, &trader);
+    verify_kyc(&t, &seller);
+
+    let cond_id = t.market.place_conditional_order(
+        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &118i128, &50i128,
+        &OrderCondition::TakeProfit(120i128),
+        &future_expiry(&t.env),
+    );
+
+    // A trade at 120 crosses the take-profit trigger.
+    let buy_id = t.market.place_order(
+        &trader, &t.token.address, &Symbol::new(&t.env, "buy"),
+        &120i128, &50i128, &future_expiry(&t.env), &0i128,
+    );
+    t.market.fill_order(&seller, &buy_id, &50i128);
+
+    let cond = t.market.get_conditional_order(&cond_id);
+    assert!(!cond.is_active);
+    assert!(cond.activated_order_id > 0);
+}
+
+#[test]
+fn conditional_order_expires_and_refunds() {
+    let t = setup();
+    let owner = Address::generate(&t.env);
+    t.token.transfer(&t.admin, &owner, &500i128);
+    verify_kyc(&t, &owner);
+
+    let rwa_before = t.token.get_balance(&owner).amount;
+    let expiry = t.env.ledger().timestamp() + 100;
+    let cond_id = t.market.place_conditional_order(
+        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &75i128, &50i128,
+        &OrderCondition::StopLoss(80i128),
+        &expiry,
+    );
+    assert_eq!(t.token.get_balance(&owner).amount, rwa_before - 50);
+
+    t.env.ledger().set_timestamp(expiry + 1);
+    t.market.evaluate_conditional_orders(&t.token.address);
+
+    let cond = t.market.get_conditional_order(&cond_id);
+    assert!(!cond.is_active);
+    assert_eq!(cond.activated_order_id, 0);
+    // Escrowed tokens are returned to the owner.
+    assert_eq!(t.token.get_balance(&owner).amount, rwa_before);
+}
+
+#[test]
+fn cancel_conditional_order_refunds_escrow() {
+    let t = setup();
+    let owner = Address::generate(&t.env);
+    t.token.transfer(&t.admin, &owner, &500i128);
+    verify_kyc(&t, &owner);
+
+    let rwa_before = t.token.get_balance(&owner).amount;
+    let cond_id = t.market.place_conditional_order(
+        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &75i128, &50i128,
+        &OrderCondition::StopLoss(80i128),
+        &future_expiry(&t.env),
+    );
+    t.market.cancel_conditional_order(&owner, &cond_id);
+
+    assert!(!t.market.get_conditional_order(&cond_id).is_active);
+    assert_eq!(t.token.get_balance(&owner).amount, rwa_before);
+}
+
+#[test]
+fn conditional_order_limit_is_enforced() {
+    let t = setup();
+    let owner = Address::generate(&t.env);
+    t.token.transfer(&t.admin, &owner, &10_000i128);
+    verify_kyc(&t, &owner);
+
+    for _ in 0..50u32 {
+        t.market.place_conditional_order(
+            &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
+            &75i128, &10i128,
+            &OrderCondition::StopLoss(1i128),
+            &future_expiry(&t.env),
+        );
+    }
+
+    // The 51st live conditional order for this user/token is rejected.
+    let res = t.market.try_place_conditional_order(
+        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &75i128, &10i128,
+        &OrderCondition::StopLoss(1i128),
+        &future_expiry(&t.env),
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn conditional_order_without_escrow_funds_panics() {
+    let t = setup();
+    let broke = Address::generate(&t.env);
+    verify_kyc(&t, &broke);
+
+    // No RWA balance to escrow → liquidity/balance check rejects the order.
+    let res = t.market.try_place_conditional_order(
+        &broke, &t.token.address, &Symbol::new(&t.env, "sell"),
+        &75i128, &50i128,
+        &OrderCondition::StopLoss(80i128),
+        &future_expiry(&t.env),
+    );
+    assert!(res.is_err());
 }
