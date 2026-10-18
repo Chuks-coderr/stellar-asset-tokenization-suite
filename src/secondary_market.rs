@@ -64,35 +64,6 @@ pub struct Trade {
     pub timestamp: u64,
 }
 
-/// One aggregated price level of the order book (issue #141).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OrderBookLevel {
-    pub price: i128,
-    pub total_amount: i128,
-    pub order_count: u32,
-}
-
-/// Aggregated, price-time-priority order book for a token (issue #141).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OrderBook {
-    /// Buy side, sorted by price descending (best first).
-    pub bids: Vec<OrderBookLevel>,
-    /// Sell side, sorted by price ascending (best first).
-    pub asks: Vec<OrderBookLevel>,
-}
-
-/// A single resting order at the top of the book (issue #141).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BookOrder {
-    pub order_id: u64,
-    pub maker: Address,
-    pub side: Symbol,
-    pub price: i128,
-    pub remaining: i128,
-    pub created_at: u64,
 /// Trigger condition for a stop-loss / take-profit order (issue #142).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,6 +94,37 @@ pub struct ConditionalOrder {
     pub activated_order_id: u64,
 }
 
+/// One aggregated price level of the order book (issue #141).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OrderBookLevel {
+    pub price: i128,
+    pub total_amount: i128,
+    pub order_count: u32,
+}
+
+/// Aggregated, price-time-priority order book for a token (issue #141).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OrderBook {
+    /// Buy side, sorted by price descending (best first).
+    pub bids: Vec<OrderBookLevel>,
+    /// Sell side, sorted by price ascending (best first).
+    pub asks: Vec<OrderBookLevel>,
+}
+
+/// A single resting order at the top of the book (issue #141).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BookOrder {
+    pub order_id: u64,
+    pub maker: Address,
+    pub side: Symbol,
+    pub price: i128,
+    pub remaining: i128,
+    pub created_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct MarketConfig {
@@ -146,25 +148,23 @@ pub enum DataKey {
     PriceHistory(Address), // Vec<Trade> or similar for VWAP
     VWAP(Address),
     LastUpdate(Address),
-    // Issue #141: sorted order-book indexes.
-    BidPrices(Address),          // Vec<i128>, descending
-    AskPrices(Address),          // Vec<i128>, ascending
-    BidOrders(Address, i128),    // Vec<u64> order ids at a bid price level
-    AskOrders(Address, i128),    // Vec<u64> order ids at an ask price level
     // Issue #142: conditional orders.
     LastPrice(Address),                     // last traded price for a token
     ConditionalCount,                       // u64 number of conditional orders
     ConditionalOrder(u64),                  // ConditionalOrder by id
     UserConditionalCount(Address, Address), // (owner, token) -> u32 active count
+    // Issue #141: sorted order-book indexes.
+    BidPrices(Address),          // Vec<i128>, descending
+    AskPrices(Address),          // Vec<i128>, ascending
+    BidOrders(Address, i128),    // Vec<u64> order ids at a bid price level
+    AskOrders(Address, i128),    // Vec<u64> order ids at an ask price level
 }
 
-// ... (around line 80)
 #[contract]
 pub struct SecondaryMarket;
 
 #[contractimpl]
 impl SecondaryMarket {
-// ...
 
     pub fn initialize(
         env: Env,
@@ -439,10 +439,14 @@ impl SecondaryMarket {
         order.filled_amount += fill_amount;
         if order.filled_amount == order.amount {
             order.is_active = false;
+            // Issue #141: a fully-filled order leaves the book.
+            Self::book_remove(env, order);
         }
         env.storage().temporary().set(&DataKey::Order(order_id), order);
 
         Self::handle_trade_data(env, order.token_address.clone(), fill_amount, order.price);
+        // Issue #142: evaluate conditional orders after every trade execution.
+        Self::evaluate_conditional_orders(env.clone(), order.token_address.clone());
 
         env.events().publish(
             (Symbol::new(env, "trade"), order.token_address.clone()),
@@ -535,13 +539,6 @@ impl SecondaryMarket {
             panic_with_error!(&env, MarketError::TradingPaused);
         }
 
-        // Issue #141: a fully-filled order leaves the book.
-        if !order.is_active {
-            Self::book_remove(&env, &order);
-        }
-
-        // Record Trade & Update VWAP/TWAP
-        Self::handle_trade_data(&env, order.token_address.clone(), fill_amount, order.price);
         Self::check_trading_halt(&env, &config, &token_address);
         Self::check_compliance(&env, &config, &taker, &token_address);
 
@@ -559,9 +556,6 @@ impl SecondaryMarket {
 
         // The taker matches the opposite side of the book.
         let resting_is_bid = is_sell;
-
-        // Issue #142: evaluate conditional orders after every trade execution.
-        Self::evaluate_conditional_orders(env.clone(), order.token_address.clone());
 
         env.events().publish(
             (Symbol::new(&env, "market_order_placed"), token_address.clone()),
@@ -631,6 +625,9 @@ impl SecondaryMarket {
         if filled_total == 0 {
             panic_with_error!(&env, MarketError::InsufficientLiquidity);
         }
+
+        // Issue #142: evaluate conditional orders after every trade execution.
+        Self::evaluate_conditional_orders(env.clone(), token_address.clone());
 
         filled_total
     }
@@ -789,239 +786,6 @@ impl SecondaryMarket {
         total_cum / (now - start_time) as i128
     }
 
-    // ── Issue #141: price-time-priority order book ────────────────────────
-    //
-    // Each side is stored as a sorted list of price levels plus a map from a
-    // price level to its resting order ids in arrival (time) order. The best
-    // price is therefore always at index 0 (O(1) best-price lookup) and a
-    // level is located in O(log n) with a binary search.
-
-    fn read_prices(env: &Env, token: &Address, is_bid: bool) -> Vec<i128> {
-        let key = if is_bid {
-            DataKey::BidPrices(token.clone())
-        } else {
-            DataKey::AskPrices(token.clone())
-        };
-        env.storage().persistent().get(&key).unwrap_or(Vec::new(env))
-    }
-
-    fn write_prices(env: &Env, token: &Address, is_bid: bool, prices: &Vec<i128>) {
-        let key = if is_bid {
-            DataKey::BidPrices(token.clone())
-        } else {
-            DataKey::AskPrices(token.clone())
-        };
-        env.storage().persistent().set(&key, prices);
-    }
-
-    fn orders_key(token: &Address, is_bid: bool, price: i128) -> DataKey {
-        if is_bid {
-            DataKey::BidOrders(token.clone(), price)
-        } else {
-            DataKey::AskOrders(token.clone(), price)
-        }
-    }
-
-    /// Insert a resting order, keeping strict price-time priority.
-    fn book_insert(env: &Env, order: &Order) {
-        let is_bid = order.side == Symbol::new(env, "buy");
-        let token = order.token_address.clone();
-        let mut prices = Self::read_prices(env, &token, is_bid);
-
-        // Binary search for the price level (desc for bids, asc for asks).
-        let mut lo: u32 = 0;
-        let mut hi: u32 = prices.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let p = prices.get(mid).unwrap();
-            let move_right = if is_bid { order.price < p } else { order.price > p };
-            if move_right {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-
-        let price_present = lo < prices.len() && prices.get(lo).unwrap() == order.price;
-        if !price_present {
-            prices.insert(lo, order.price);
-            Self::write_prices(env, &token, is_bid, &prices);
-        }
-
-        // Append at the level: arrival order is time priority.
-        let level_key = Self::orders_key(&token, is_bid, order.price);
-        let mut ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&level_key)
-            .unwrap_or(Vec::new(env));
-        ids.push_back(order.id);
-        env.storage().persistent().set(&level_key, &ids);
-    }
-
-    /// Remove an order from the book (cancel, full fill or expiry).
-    fn book_remove(env: &Env, order: &Order) {
-        let is_bid = order.side == Symbol::new(env, "buy");
-        let token = order.token_address.clone();
-        let level_key = Self::orders_key(&token, is_bid, order.price);
-
-        let ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&level_key)
-            .unwrap_or(Vec::new(env));
-
-        let mut kept = Vec::<u64>::new(env);
-        let mut removed = false;
-        for id in ids.iter() {
-            if id == order.id {
-                removed = true;
-            } else {
-                kept.push_back(id);
-            }
-        }
-
-        if !removed {
-            return;
-        }
-
-        if kept.len() == 0 {
-            env.storage().persistent().remove(&level_key);
-            // Drop the now-empty price level.
-            let prices = Self::read_prices(env, &token, is_bid);
-            let mut new_prices = Vec::<i128>::new(env);
-            for p in prices.iter() {
-                if p != order.price {
-                    new_prices.push_back(p);
-                }
-            }
-            Self::write_prices(env, &token, is_bid, &new_prices);
-        } else {
-            env.storage().persistent().set(&level_key, &kept);
-        }
-    }
-
-    fn book_levels(env: &Env, token: &Address, is_bid: bool) -> Vec<OrderBookLevel> {
-        let prices = Self::read_prices(env, token, is_bid);
-        let mut levels = Vec::<OrderBookLevel>::new(env);
-        for price in prices.iter() {
-            let key = Self::orders_key(token, is_bid, price);
-            let ids: Vec<u64> = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or(Vec::new(env));
-            let mut total: i128 = 0;
-            let mut count: u32 = 0;
-            for id in ids.iter() {
-                if let Some(order) = env
-                    .storage()
-                    .temporary()
-                    .get::<DataKey, Order>(&DataKey::Order(id))
-                {
-                    if order.is_active {
-                        total += order.amount - order.filled_amount;
-                        count += 1;
-                    }
-                }
-            }
-            if count > 0 {
-                levels.push_back(OrderBookLevel {
-                    price,
-                    total_amount: total,
-                    order_count: count,
-                });
-            }
-        }
-        levels
-    }
-
-    fn best_order_id(env: &Env, token: &Address, is_bid: bool) -> Option<u64> {
-        let prices = Self::read_prices(env, token, is_bid);
-        let now = env.ledger().timestamp();
-        for price in prices.iter() {
-            let key = Self::orders_key(token, is_bid, price);
-            let ids: Vec<u64> = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or(Vec::new(env));
-            for id in ids.iter() {
-                if let Some(order) = env
-                    .storage()
-                    .temporary()
-                    .get::<DataKey, Order>(&DataKey::Order(id))
-                {
-                    if order.is_active && order.expires_at > now {
-                        return Some(id);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn best_order(env: &Env, token: &Address, is_bid: bool) -> Option<BookOrder> {
-        let id = Self::best_order_id(env, token, is_bid)?;
-        let order: Order = env
-            .storage()
-            .temporary()
-            .get(&DataKey::Order(id))?;
-        Some(BookOrder {
-            order_id: id,
-            maker: order.maker.clone(),
-            side: order.side.clone(),
-            price: order.price,
-            remaining: order.amount - order.filled_amount,
-            created_at: order.created_at,
-        })
-    }
-
-    /// Full aggregated order book for `token`, sorted by price-time priority.
-    pub fn get_order_book(env: Env, token: Address) -> OrderBook {
-        OrderBook {
-            bids: Self::book_levels(&env, &token, true),
-            asks: Self::book_levels(&env, &token, false),
-        }
-    }
-
-    /// Best (highest-priced) resting buy order.
-    pub fn get_best_bid(env: Env, token: Address) -> Option<BookOrder> {
-        Self::best_order(&env, &token, true)
-    }
-
-    /// Best (lowest-priced) resting sell order.
-    pub fn get_best_ask(env: Env, token: Address) -> Option<BookOrder> {
-        Self::best_order(&env, &token, false)
-    }
-
-    /// Match an incoming `taker_side` order against the best-priced resting
-    /// order on the opposite side and fill it completely.
-    ///
-    /// Returns the id of the order that was filled. Panics with
-    /// `InsufficientLiquidity` when the opposite side of the book is empty.
-    pub fn match_best_order(
-        env: Env,
-        taker: Address,
-        token_address: Address,
-        taker_side: Symbol,
-    ) -> u64 {
-        let is_bid_taker = taker_side == Symbol::new(&env, "buy");
-        // A buyer matches resting sells (asks); a seller matches resting buys.
-        let resting_is_bid = !is_bid_taker;
-        let best = Self::best_order_id(&env, &token_address, resting_is_bid)
-            .unwrap_or_else(|| panic_with_error!(&env, MarketError::InsufficientLiquidity));
-
-        let order: Order = env
-            .storage()
-            .temporary()
-            .get(&DataKey::Order(best))
-            .unwrap_or_else(|| panic_with_error!(&env, MarketError::OrderNotFound));
-        let remaining = order.amount - order.filled_amount;
-
-        // `fill_order` performs the single authorisation and settlement.
-        Self::fill_order(env, taker, best, remaining);
-        best
     // ── Issue #142: stop-loss / take-profit conditional orders ────────────
 
     fn read_last_price(env: &Env, token: &Address) -> i128 {
@@ -1284,6 +1048,9 @@ impl SecondaryMarket {
             .temporary()
             .set(&DataKey::Order(count), &order);
 
+        // Issue #141: activated conditional orders rest on the book.
+        Self::book_insert(env, &order);
+
         env.events().publish(
             (
                 Symbol::new(env, "conditional_order_triggered"),
@@ -1314,6 +1081,240 @@ impl SecondaryMarket {
         }
     }
 
+    // ── Issue #141: price-time-priority order book ────────────────────────
+    //
+    // Each side is stored as a sorted list of price levels plus a map from a
+    // price level to its resting order ids in arrival (time) order. The best
+    // price is therefore always at index 0 (O(1) best-price lookup) and a
+    // level is located in O(log n) with a binary search.
+
+    fn read_prices(env: &Env, token: &Address, is_bid: bool) -> Vec<i128> {
+        let key = if is_bid {
+            DataKey::BidPrices(token.clone())
+        } else {
+            DataKey::AskPrices(token.clone())
+        };
+        env.storage().persistent().get(&key).unwrap_or(Vec::new(env))
+    }
+
+    fn write_prices(env: &Env, token: &Address, is_bid: bool, prices: &Vec<i128>) {
+        let key = if is_bid {
+            DataKey::BidPrices(token.clone())
+        } else {
+            DataKey::AskPrices(token.clone())
+        };
+        env.storage().persistent().set(&key, prices);
+    }
+
+    fn orders_key(token: &Address, is_bid: bool, price: i128) -> DataKey {
+        if is_bid {
+            DataKey::BidOrders(token.clone(), price)
+        } else {
+            DataKey::AskOrders(token.clone(), price)
+        }
+    }
+
+    /// Insert a resting order, keeping strict price-time priority.
+    fn book_insert(env: &Env, order: &Order) {
+        let is_bid = order.side == Symbol::new(env, "buy");
+        let token = order.token_address.clone();
+        let mut prices = Self::read_prices(env, &token, is_bid);
+
+        // Binary search for the price level (desc for bids, asc for asks).
+        let mut lo: u32 = 0;
+        let mut hi: u32 = prices.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let p = prices.get(mid).unwrap();
+            let move_right = if is_bid { order.price < p } else { order.price > p };
+            if move_right {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        let price_present = lo < prices.len() && prices.get(lo).unwrap() == order.price;
+        if !price_present {
+            prices.insert(lo, order.price);
+            Self::write_prices(env, &token, is_bid, &prices);
+        }
+
+        // Append at the level: arrival order is time priority.
+        let level_key = Self::orders_key(&token, is_bid, order.price);
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&level_key)
+            .unwrap_or(Vec::new(env));
+        ids.push_back(order.id);
+        env.storage().persistent().set(&level_key, &ids);
+    }
+
+    /// Remove an order from the book (cancel, full fill or expiry).
+    fn book_remove(env: &Env, order: &Order) {
+        let is_bid = order.side == Symbol::new(env, "buy");
+        let token = order.token_address.clone();
+        let level_key = Self::orders_key(&token, is_bid, order.price);
+
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&level_key)
+            .unwrap_or(Vec::new(env));
+
+        let mut kept = Vec::<u64>::new(env);
+        let mut removed = false;
+        for id in ids.iter() {
+            if id == order.id {
+                removed = true;
+            } else {
+                kept.push_back(id);
+            }
+        }
+
+        if !removed {
+            return;
+        }
+
+        if kept.len() == 0 {
+            env.storage().persistent().remove(&level_key);
+            // Drop the now-empty price level.
+            let prices = Self::read_prices(env, &token, is_bid);
+            let mut new_prices = Vec::<i128>::new(env);
+            for p in prices.iter() {
+                if p != order.price {
+                    new_prices.push_back(p);
+                }
+            }
+            Self::write_prices(env, &token, is_bid, &new_prices);
+        } else {
+            env.storage().persistent().set(&level_key, &kept);
+        }
+    }
+
+    fn book_levels(env: &Env, token: &Address, is_bid: bool) -> Vec<OrderBookLevel> {
+        let prices = Self::read_prices(env, token, is_bid);
+        let mut levels = Vec::<OrderBookLevel>::new(env);
+        for price in prices.iter() {
+            let key = Self::orders_key(token, is_bid, price);
+            let ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(Vec::new(env));
+            let mut total: i128 = 0;
+            let mut count: u32 = 0;
+            for id in ids.iter() {
+                if let Some(order) = env
+                    .storage()
+                    .temporary()
+                    .get::<DataKey, Order>(&DataKey::Order(id))
+                {
+                    if order.is_active {
+                        total += order.amount - order.filled_amount;
+                        count += 1;
+                    }
+                }
+            }
+            if count > 0 {
+                levels.push_back(OrderBookLevel {
+                    price,
+                    total_amount: total,
+                    order_count: count,
+                });
+            }
+        }
+        levels
+    }
+
+    fn best_order_id(env: &Env, token: &Address, is_bid: bool) -> Option<u64> {
+        let prices = Self::read_prices(env, token, is_bid);
+        let now = env.ledger().timestamp();
+        for price in prices.iter() {
+            let key = Self::orders_key(token, is_bid, price);
+            let ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(Vec::new(env));
+            for id in ids.iter() {
+                if let Some(order) = env
+                    .storage()
+                    .temporary()
+                    .get::<DataKey, Order>(&DataKey::Order(id))
+                {
+                    if order.is_active && order.expires_at > now {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn best_order(env: &Env, token: &Address, is_bid: bool) -> Option<BookOrder> {
+        let id = Self::best_order_id(env, token, is_bid)?;
+        let order: Order = env
+            .storage()
+            .temporary()
+            .get(&DataKey::Order(id))?;
+        Some(BookOrder {
+            order_id: id,
+            maker: order.maker.clone(),
+            side: order.side.clone(),
+            price: order.price,
+            remaining: order.amount - order.filled_amount,
+            created_at: order.created_at,
+        })
+    }
+
+    /// Full aggregated order book for `token`, sorted by price-time priority.
+    pub fn get_order_book(env: Env, token: Address) -> OrderBook {
+        OrderBook {
+            bids: Self::book_levels(&env, &token, true),
+            asks: Self::book_levels(&env, &token, false),
+        }
+    }
+
+    /// Best (highest-priced) resting buy order.
+    pub fn get_best_bid(env: Env, token: Address) -> Option<BookOrder> {
+        Self::best_order(&env, &token, true)
+    }
+
+    /// Best (lowest-priced) resting sell order.
+    pub fn get_best_ask(env: Env, token: Address) -> Option<BookOrder> {
+        Self::best_order(&env, &token, false)
+    }
+
+    /// Match an incoming `taker_side` order against the best-priced resting
+    /// order on the opposite side and fill it completely.
+    ///
+    /// Returns the id of the order that was filled. Panics with
+    /// `InsufficientLiquidity` when the opposite side of the book is empty.
+    pub fn match_best_order(
+        env: Env,
+        taker: Address,
+        token_address: Address,
+        taker_side: Symbol,
+    ) -> u64 {
+        let is_bid_taker = taker_side == Symbol::new(&env, "buy");
+        // A buyer matches resting sells (asks); a seller matches resting buys.
+        let resting_is_bid = !is_bid_taker;
+        let best = Self::best_order_id(&env, &token_address, resting_is_bid)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketError::InsufficientLiquidity));
+
+        let order: Order = env
+            .storage()
+            .temporary()
+            .get(&DataKey::Order(best))
+            .unwrap_or_else(|| panic_with_error!(&env, MarketError::OrderNotFound));
+        let remaining = order.amount - order.filled_amount;
+
+        // `fill_order` performs the single authorisation and settlement.
+        Self::fill_order(env, taker, best, remaining);
+        best
+    }
     // --- Private Logics ---
 
     fn check_trading_halt(env: &Env, config: &MarketConfig, token: &Address) {
