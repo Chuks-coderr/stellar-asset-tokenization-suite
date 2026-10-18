@@ -88,7 +88,6 @@ impl RWAToken {
         compliance_registry: Address,
         dividend_distributor: Address,
     ) {
-        auth.require_auth();
         if env
             .storage()
             .instance()
@@ -126,6 +125,12 @@ impl RWAToken {
             .set(&Symbol::new(&env, "locks"),
             &Map::<Address, LockSlot>::new(&env),
         );
+
+        // The initializing `auth` becomes this token's admin: `mint` (which
+        // performs the single auth check for this frame) requires it.
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "admin"), &auth);
 
         Self::mint(env.clone(), auth.clone(), auth.clone(), total_supply);
 
