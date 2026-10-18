@@ -68,7 +68,7 @@ pub struct ComplianceRegistry;
 #[contractimpl]
 
 impl ComplianceRegistry {
-// ...
+    // ...
 
     pub fn initialize(
         env: Env,
@@ -77,8 +77,8 @@ impl ComplianceRegistry {
         kyc_required: bool,
         transfer_restrictions: bool,
     ) {
+        // `write_admin` performs the single auth check for this frame.
         crate::shared_admin::write_admin(&env, &auth, &admin);
-        auth.require_auth();
         if env
             .storage()
             .instance()
@@ -161,6 +161,18 @@ impl ComplianceRegistry {
                 kyc_status.risk_score,
             ),
         );
+    }
+
+    /// Whether participants must be KYC-verified before they can trade.
+    ///
+    /// The secondary market consults this before gating an order so a registry
+    /// configured with `kyc_required == false` keeps working without every
+    /// participant being verified.
+    pub fn is_kyc_required(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "kyc_required"))
+            .unwrap_or(true)
     }
 
     pub fn get_kyc_status(env: Env, user: Address) -> KYCStatus {
