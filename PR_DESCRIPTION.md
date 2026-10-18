@@ -1,5 +1,6 @@
 # PR: Resolve Issues #147, #148, #149, #150 for @davidsoniaudin2-oss
 
+## Summary
 
 Resolves the four secondary-market issues assigned to @davidsoniaudin2-oss:
 
