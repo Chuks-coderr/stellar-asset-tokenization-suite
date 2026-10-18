@@ -3,14 +3,17 @@
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
     token::{StellarAssetClient, TokenClient},
-    Address, Env, Map, Symbol, Vec,
+    Address, Env, Error as SdkError, InvokeError, Map, Symbol, Vec,
 };
 
 use crate::{
     compliance_registry::{ComplianceRegistry, ComplianceRegistryClient, KYCStatus},
     dividend_distributor::{DividendDistributor, DividendDistributorClient},
     rwa_token::{RWAToken, RWATokenClient},
-    secondary_market::{MarketError, OrderCondition, SecondaryMarket, SecondaryMarketClient},
+    secondary_market::{
+        CircuitBreakerConfig, FeeTier, MarketError, OrderCondition, SecondaryMarket,
+        SecondaryMarketClient,
+    },
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -80,7 +83,14 @@ fn setup() -> TestEnv {
     let base_token: TokenClient<'static> = unsafe { core::mem::transmute(base_token) };
     let compliance: ComplianceRegistryClient<'static> = unsafe { core::mem::transmute(compliance) };
 
-    TestEnv { env, admin, market, token, base_token, compliance }
+    TestEnv {
+        env,
+        admin,
+        market,
+        token,
+        base_token,
+        compliance,
+    }
 }
 
 fn future_expiry(env: &Env) -> u64 {
@@ -118,15 +128,8 @@ fn initialize_succeeds() {
 fn initialize_twice_panics() {
     let t = setup();
     let other = Address::generate(&t.env);
-    t.market.initialize(
-        &t.admin,
-        &other,
-        &other,
-        &other,
-        &50i64,
-        &10i128,
-        &2000i64,
-    );
+    t.market
+        .initialize(&t.admin, &other, &other, &other, &50i64, &10i128, &2000i64);
 }
 
 // ── place_order (buy) ─────────────────────────────────────────────────────────
@@ -143,10 +146,10 @@ fn place_buy_order_returns_order_id() {
         &buyer,
         &t.token.address,
         &Symbol::new(&t.env, "buy"),
-        &100i128,  // price
-        &50i128,   // amount
+        &100i128, // price
+        &50i128,  // amount
         &future_expiry(&t.env),
-        &0i128,    // min_fill
+        &0i128, // min_fill
     );
     assert_eq!(order_id, 1);
 }
@@ -159,12 +162,22 @@ fn place_multiple_orders_increments_ids() {
     base_admin.mint(&buyer, &100_000i128);
 
     let id1 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let id2 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     assert_eq!(id2, id1 + 1);
 }
@@ -179,8 +192,13 @@ fn place_order_below_min_size_panics() {
 
     // amount = 5, min_order_size = 10
     t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &5i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &5i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 }
 
@@ -193,8 +211,13 @@ fn place_order_with_zero_price_panics() {
     base_admin.mint(&buyer, &10_000i128);
 
     t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &0i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &0i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 }
 
@@ -208,8 +231,13 @@ fn place_order_with_expired_expiry_panics() {
 
     // expiry in the past
     t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &50i128, &0u64, &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &50i128,
+        &0u64,
+        &0i128,
     );
 }
 
@@ -222,8 +250,13 @@ fn place_order_with_invalid_side_panics() {
     base_admin.mint(&buyer, &10_000i128);
 
     t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "invalid"),
-        &100i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "invalid"),
+        &100i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 }
 
@@ -237,8 +270,13 @@ fn place_sell_order_escrows_rwa_tokens() {
 
     let balance_before = t.token.get_balance(&seller).amount;
     t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &100i128, &100i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let balance_after = t.token.get_balance(&seller).amount;
     assert_eq!(balance_before - balance_after, 100);
@@ -255,8 +293,13 @@ fn cancel_buy_order_refunds_base_currency() {
 
     let balance_before = t.base_token.balance(&buyer);
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.cancel_order(&buyer, &order_id);
     let balance_after = t.base_token.balance(&buyer);
@@ -271,8 +314,13 @@ fn cancel_sell_order_refunds_rwa_tokens() {
 
     let balance_before = t.token.get_balance(&seller).amount;
     let order_id = t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &100i128, &100i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.cancel_order(&seller, &order_id);
     let balance_after = t.token.get_balance(&seller).amount;
@@ -289,8 +337,13 @@ fn cancel_order_by_non_maker_panics() {
     base_admin.mint(&buyer, &10_000i128);
 
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.cancel_order(&attacker, &order_id);
 }
@@ -317,8 +370,13 @@ fn fill_buy_order_settles_correctly() {
 
     // Buyer places buy order: 100 tokens at price 10 each = 1000 base
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &100i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     let seller_rwa_before = t.token.get_balance(&seller).amount;
@@ -345,8 +403,13 @@ fn fill_order_exceeding_remaining_amount_panics() {
     t.token.transfer(&t.admin, &seller, &500i128);
 
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     // Try to fill 100 when order is only for 50
@@ -381,8 +444,13 @@ fn get_vwap_reflects_trade_price_after_fill() {
     t.token.transfer(&t.admin, &seller, &200i128);
 
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &50i128, &100i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &50i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.fill_order(&seller, &order_id, &100i128);
 
@@ -428,8 +496,13 @@ fn place_order_by_unverified_user_when_kyc_required_panics() {
     let market_id = env.register_contract(None, SecondaryMarket);
     let market = SecondaryMarketClient::new(&env, &market_id);
     market.initialize(
-        &admin, &base_id.address(), &compliance_id, &dist_id,
-        &50i64, &10i128, &2000i64,
+        &admin,
+        &base_id.address(),
+        &compliance_id,
+        &dist_id,
+        &50i64,
+        &10i128,
+        &2000i64,
     );
 
     let unverified_buyer = Address::generate(&env);
@@ -437,9 +510,11 @@ fn place_order_by_unverified_user_when_kyc_required_panics() {
 
     // Should panic because KYC is required and buyer is not verified
     market.place_order(
-        &unverified_buyer, &token_id,
+        &unverified_buyer,
+        &token_id,
         &Symbol::new(&env, "buy"),
-        &100i128, &50i128,
+        &100i128,
+        &50i128,
         &(env.ledger().timestamp() + 3600),
         &0i128,
     );
@@ -465,8 +540,13 @@ fn concurrent_fill_same_order_partial_fills_settle_correctly() {
 
     // Buyer places buy order for 100 tokens
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &100i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     // Two sellers fill the same order (partial fills)
@@ -494,8 +574,13 @@ fn concurrent_fill_same_order_no_double_fill() {
 
     // Buy order for exactly 50 tokens
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     // First seller fills completely
@@ -524,8 +609,13 @@ fn concurrent_fill_exceeding_remaining_panics_no_double_spend() {
     t.token.transfer(&t.admin, &seller2, &200i128);
 
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     // First seller fills 40
@@ -559,14 +649,24 @@ fn rapid_place_cancel_fill_sequence_maintains_integrity() {
 
     // Rapid sequence: place -> cancel -> re-place -> fill
     let id1 = t.market.place_order(
-        &user_a, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &future_expiry(&t.env), &0i128,
+        &user_a,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.cancel_order(&user_a, &id1);
 
     let id2 = t.market.place_order(
-        &user_a, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &future_expiry(&t.env), &0i128,
+        &user_a,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.fill_order(&user_b, &id2, &50i128);
 
@@ -594,8 +694,13 @@ fn rapid_fill_on_multiple_orders_same_account_no_lost_funds() {
     let mut order_ids = Vec::new(&t.env);
     for _ in 0..5 {
         let id = t.market.place_order(
-            &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-            &10i128, &20i128, &future_expiry(&t.env), &0i128,
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &10i128,
+            &20i128,
+            &future_expiry(&t.env),
+            &0i128,
         );
         order_ids.push_back(id);
     }
@@ -607,7 +712,10 @@ fn rapid_fill_on_multiple_orders_same_account_no_lost_funds() {
     }
 
     // Seller sold 5 * 20 = 100 tokens
-    assert_eq!(t.token.get_balance(&seller).amount, seller_balance_before - 100);
+    assert_eq!(
+        t.token.get_balance(&seller).amount,
+        seller_balance_before - 100
+    );
     // Buyer received 100 tokens
     assert_eq!(t.token.get_balance(&buyer).amount, 100);
 }
@@ -626,8 +734,13 @@ fn order_created_and_filled_same_ledger() {
 
     // Place and fill without advancing ledger
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.fill_order(&seller, &order_id, &50i128);
 
@@ -647,8 +760,13 @@ fn multiple_orders_placed_filled_same_ledger() {
 
     for i in 0..10 {
         let order_id = t.market.place_order(
-            &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-            &10i128, &10i128, &future_expiry(&t.env), &0i128,
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &10i128,
+            &10i128,
+            &future_expiry(&t.env),
+            &0i128,
         );
         t.market.fill_order(&seller, &order_id, &10i128);
     }
@@ -677,8 +795,13 @@ fn escrow_balances_correct_after_multiple_fills() {
     let ids: std::vec::Vec<u64> = (0..3)
         .map(|_| {
             t.market.place_order(
-                &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-                &10i128, &30i128, &future_expiry(&t.env), &0i128,
+                &buyer,
+                &t.token.address,
+                &Symbol::new(&t.env, "buy"),
+                &10i128,
+                &30i128,
+                &future_expiry(&t.env),
+                &0i128,
             )
         })
         .collect();
@@ -710,8 +833,13 @@ fn escrow_returns_correctly_after_full_cancellation() {
     let mut order_ids = Vec::new(&t.env);
     for _ in 0..5 {
         let id = t.market.place_order(
-            &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-            &10i128, &20i128, &future_expiry(&t.env), &0i128,
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &10i128,
+            &20i128,
+            &future_expiry(&t.env),
+            &0i128,
         );
         order_ids.push_back(id);
     }
@@ -747,15 +875,25 @@ fn flash_crash_scenario_buy_sell_oscillation() {
     // Simulate rapid price changes: wide price oscillation
     // trader1 buys high, trader2 sells into it
     let o1 = t.market.place_order(
-        &trader1, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &200i128, &10i128, &future_expiry(&t.env), &0i128,
+        &trader1,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &200i128,
+        &10i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.fill_order(&trader2, &o1, &10i128);
 
     // trader2 buys low
     let o2 = t.market.place_order(
-        &trader2, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &10i128, &future_expiry(&t.env), &0i128,
+        &trader2,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &10i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.fill_order(&trader1, &o2, &10i128);
 
@@ -797,8 +935,13 @@ fn stress_test_100_orders_rapid_matching() {
     let mut order_ids = Vec::new(&t.env);
     for _ in 0..100 {
         let id = t.market.place_order(
-            &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-            &10i128, &5i128, &future_expiry(&t.env), &0i128,
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &10i128,
+            &5i128,
+            &future_expiry(&t.env),
+            &0i128,
         );
         order_ids.push_back(id);
     }
@@ -837,15 +980,25 @@ fn stress_test_interleaved_buy_sell_orders() {
     for _ in 0..50 {
         // A places buy
         let buy_id = t.market.place_order(
-            &trader_a, &t.token.address, &Symbol::new(&t.env, "buy"),
-            &10i128, &2i128, &future_expiry(&t.env), &0i128,
+            &trader_a,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &10i128,
+            &2i128,
+            &future_expiry(&t.env),
+            &0i128,
         );
         t.market.fill_order(&trader_b, &buy_id, &2i128);
 
         // B places buy
         let sell_id = t.market.place_order(
-            &trader_b, &t.token.address, &Symbol::new(&t.env, "buy"),
-            &10i128, &2i128, &future_expiry(&t.env), &0i128,
+            &trader_b,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &10i128,
+            &2i128,
+            &future_expiry(&t.env),
+            &0i128,
         );
         t.market.fill_order(&trader_a, &sell_id, &2i128);
     }
@@ -871,8 +1024,13 @@ fn no_double_fill_on_partially_filled_order() {
     t.token.transfer(&t.admin, &third_party, &200i128);
 
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &100i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     // Partial fill by seller (takes 40)
@@ -908,8 +1066,13 @@ fn migrate_preserves_market_config() {
     t.token.transfer(&t.admin, &seller, &200i128);
 
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &50i128, &100i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &50i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.fill_order(&seller, &order_id, &100i128);
 
@@ -928,16 +1091,31 @@ fn migrate_preserves_order_book_state() {
 
     // Place 3 orders at different prices
     let id1 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &10i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &10i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let id2 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &90i128, &20i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &90i128,
+        &20i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let id3 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &80i128, &30i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &80i128,
+        &30i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     assert_eq!(id3, id1 + 2); // IDs increment correctly
@@ -967,8 +1145,13 @@ fn migrate_preserves_vwap_twap_after_multiple_trades() {
     // Execute 3 trades at different prices
     for price in [50, 100, 200] {
         let order_id = t.market.place_order(
-            &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-            &price, &10i128, &future_expiry(&t.env), &0i128,
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &price,
+            &10i128,
+            &future_expiry(&t.env),
+            &0i128,
         );
         t.market.fill_order(&seller, &order_id, &10i128);
     }
@@ -1005,8 +1188,13 @@ fn migrate_with_empty_order_book() {
     base_admin.mint(&buyer, &10_000i128);
 
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &50i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &50i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     assert_eq!(order_id, 1);
 }
@@ -1026,16 +1214,31 @@ fn migrate_preserves_escrow_integrity() {
 
     // Place 2 buy orders and 1 sell order simultaneously
     let buy1 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &20i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &20i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let buy2 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &30i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &30i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let sell1 = t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &10i128, &40i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &10i128,
+        &40i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     // Fill buy1, cancel buy2, leave sell1 active
@@ -1046,7 +1249,10 @@ fn migrate_preserves_escrow_integrity() {
     // buy1 filled: buyer paid 200 base, got 20 RWA
     // buy2 cancelled: buyer got 300 base back
     // sell1 active: seller has 40 RWA in escrow
-    assert_eq!(t.token.get_balance(&seller).amount, seller_rwa_before - 20 - 40);
+    assert_eq!(
+        t.token.get_balance(&seller).amount,
+        seller_rwa_before - 20 - 40
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1065,8 +1271,13 @@ fn test_fill_expired_order_rejection() {
 
     let expiry = t.env.ledger().timestamp() + 100;
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &expiry, &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &expiry,
+        &0i128,
     );
 
     // Advance time past expiry
@@ -1086,8 +1297,13 @@ fn test_cancel_expired_order_success() {
 
     let expiry = t.env.ledger().timestamp() + 100;
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &expiry, &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &expiry,
+        &0i128,
     );
 
     assert_eq!(t.base_token.balance(&buyer), balance_before - 500);
@@ -1110,8 +1326,13 @@ fn test_auto_pruning_expired_orders() {
 
     let expiry = t.env.ledger().timestamp() + 50;
     let order_id = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &expiry, &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &expiry,
+        &0i128,
     );
 
     // Advance ledger timestamp past expiry
@@ -1140,13 +1361,21 @@ fn market_buy_fills_lowest_ask_completely() {
     verify_kyc(&t, &seller);
 
     let ask = t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &10i128, &100i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &10i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     let filled = t.market.place_market_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &10i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &10i128,
     );
     assert_eq!(filled, 100);
     assert_eq!(t.token.get_balance(&buyer).amount, 100);
@@ -1168,22 +1397,33 @@ fn market_buy_partial_fill_leaves_order_resting() {
 
     // 200 RWA available at 10.
     t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &10i128, &200i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &10i128,
+        &200i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     // Taker only wants 50: partial fill, 150 left resting.
     let filled = t.market.place_market_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &50i128, &10i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &50i128,
+        &10i128,
     );
     assert_eq!(filled, 50);
     assert_eq!(t.token.get_balance(&buyer).amount, 50);
 
     // A second market buy consumes more of the same resting order.
     let filled2 = t.market.place_market_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &10i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &10i128,
     );
     assert_eq!(filled2, 100);
     assert_eq!(t.token.get_balance(&buyer).amount, 150);
@@ -1202,17 +1442,30 @@ fn market_sell_fills_highest_bid_first() {
 
     // Bids at 10 and 12; the 12 bid must be filled first.
     t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &10i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &12i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &12i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     let filled = t.market.place_market_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &50i128, &10i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &50i128,
+        &10i128,
     );
     assert_eq!(filled, 50);
 
@@ -1229,8 +1482,11 @@ fn market_order_without_liquidity_panics() {
     verify_kyc(&t, &buyer);
 
     let res = t.market.try_place_market_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &10i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &10i128,
     );
     assert!(res.is_err());
 }
@@ -1248,13 +1504,21 @@ fn market_buy_beyond_limit_price_rejected() {
 
     // Cheapest ask is 20, but the taker only accepts up to 10.
     t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &20i128, &100i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &20i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     let res = t.market.try_place_market_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &10i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &10i128,
     );
     assert!(res.is_err());
     // Nothing moved.
@@ -1277,30 +1541,60 @@ fn order_book_sorts_bids_desc_and_asks_asc() {
 
     // Bids placed out of order: 100, 120, 90.
     t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &50i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let best_bid = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &120i128, &40i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &120i128,
+        &40i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &90i128, &30i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &90i128,
+        &30i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     // Asks placed out of order: 200, 150, 180.
     t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &200i128, &20i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &200i128,
+        &20i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let best_ask = t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &150i128, &25i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &150i128,
+        &25i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &180i128, &15i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &180i128,
+        &15i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     let book = t.market.get_order_book(&t.token.address);
@@ -1310,8 +1604,14 @@ fn order_book_sorts_bids_desc_and_asks_asc() {
     assert_eq!(ask_prices, std::vec![150i128, 180, 200]);
 
     // O(1) best-price lookup points at index 0 of each side.
-    assert_eq!(t.market.get_best_bid(&t.token.address).unwrap().order_id, best_bid);
-    assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, best_ask);
+    assert_eq!(
+        t.market.get_best_bid(&t.token.address).unwrap().order_id,
+        best_bid
+    );
+    assert_eq!(
+        t.market.get_best_ask(&t.token.address).unwrap().order_id,
+        best_ask
+    );
 }
 
 #[test]
@@ -1323,16 +1623,31 @@ fn order_book_insertion_and_removal() {
     verify_kyc(&t, &buyer);
 
     let o1 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &20i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &20i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let o2 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &100i128, &30i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &30i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let o3 = t.market.place_order(
-        &buyer, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &110i128, &25i128, &future_expiry(&t.env), &0i128,
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &110i128,
+        &25i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     // Two orders at 100 aggregate into a single level (time-ordered).
@@ -1371,21 +1686,34 @@ fn match_best_order_fills_top_of_book() {
 
     // Two asks: 150 and 200. The 150 ask is best.
     let ask_lo = t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &150i128, &40i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &150i128,
+        &40i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let ask_hi = t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &200i128, &40i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &200i128,
+        &40i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
-    let filled_id = t
-        .market
-        .match_best_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"));
+    let filled_id =
+        t.market
+            .match_best_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"));
     assert_eq!(filled_id, ask_lo);
 
     // Top of book advances to the 200 ask, and the buyer received 40 RWA.
-    assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, ask_hi);
+    assert_eq!(
+        t.market.get_best_ask(&t.token.address).unwrap().order_id,
+        ask_hi
+    );
     assert_eq!(t.token.get_balance(&buyer).amount, 40);
 }
 
@@ -1402,19 +1730,32 @@ fn match_best_order_respects_time_priority() {
 
     // Two asks at the same price: the earliest must be matched first.
     let first = t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &100i128, &40i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &40i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     let second = t.market.place_order(
-        &seller, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &100i128, &40i128, &future_expiry(&t.env), &0i128,
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &40i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
 
     let filled = t
         .market
         .match_best_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"));
     assert_eq!(filled, first);
-    assert_eq!(t.market.get_best_ask(&t.token.address).unwrap().order_id, second);
+    assert_eq!(
+        t.market.get_best_ask(&t.token.address).unwrap().order_id,
+        second
+    );
 }
 
 // Issue #142: stop-loss and take-profit conditional orders
@@ -1436,8 +1777,11 @@ fn stop_loss_triggers_on_price_drop() {
 
     let rwa_before = t.token.get_balance(&owner).amount;
     let cond_id = t.market.place_conditional_order(
-        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &75i128, &50i128,
+        &owner,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &75i128,
+        &50i128,
         &OrderCondition::StopLoss(80i128),
         &future_expiry(&t.env),
     );
@@ -1450,8 +1794,13 @@ fn stop_loss_triggers_on_price_drop() {
 
     // A trade at 80 crosses the stop-loss trigger.
     let buy_id = t.market.place_order(
-        &trader, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &80i128, &50i128, &future_expiry(&t.env), &0i128,
+        &trader,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &80i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.fill_order(&seller, &buy_id, &50i128);
 
@@ -1464,7 +1813,8 @@ fn stop_loss_triggers_on_price_drop() {
     let buyer = Address::generate(&t.env);
     base_admin.mint(&buyer, &1_000_000i128);
     verify_kyc(&t, &buyer);
-    t.market.fill_order(&buyer, &cond.activated_order_id, &50i128);
+    t.market
+        .fill_order(&buyer, &cond.activated_order_id, &50i128);
     assert_eq!(t.token.get_balance(&buyer).amount, 50);
 }
 
@@ -1483,16 +1833,24 @@ fn take_profit_triggers_on_price_rise() {
     verify_kyc(&t, &seller);
 
     let cond_id = t.market.place_conditional_order(
-        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &118i128, &50i128,
+        &owner,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &118i128,
+        &50i128,
         &OrderCondition::TakeProfit(120i128),
         &future_expiry(&t.env),
     );
 
     // A trade at 120 crosses the take-profit trigger.
     let buy_id = t.market.place_order(
-        &trader, &t.token.address, &Symbol::new(&t.env, "buy"),
-        &120i128, &50i128, &future_expiry(&t.env), &0i128,
+        &trader,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &120i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
     );
     t.market.fill_order(&seller, &buy_id, &50i128);
 
@@ -1511,8 +1869,11 @@ fn conditional_order_expires_and_refunds() {
     let rwa_before = t.token.get_balance(&owner).amount;
     let expiry = t.env.ledger().timestamp() + 100;
     let cond_id = t.market.place_conditional_order(
-        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &75i128, &50i128,
+        &owner,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &75i128,
+        &50i128,
         &OrderCondition::StopLoss(80i128),
         &expiry,
     );
@@ -1537,8 +1898,11 @@ fn cancel_conditional_order_refunds_escrow() {
 
     let rwa_before = t.token.get_balance(&owner).amount;
     let cond_id = t.market.place_conditional_order(
-        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &75i128, &50i128,
+        &owner,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &75i128,
+        &50i128,
         &OrderCondition::StopLoss(80i128),
         &future_expiry(&t.env),
     );
@@ -1557,8 +1921,11 @@ fn conditional_order_limit_is_enforced() {
 
     for _ in 0..50u32 {
         t.market.place_conditional_order(
-            &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
-            &75i128, &10i128,
+            &owner,
+            &t.token.address,
+            &Symbol::new(&t.env, "sell"),
+            &75i128,
+            &10i128,
             &OrderCondition::StopLoss(1i128),
             &future_expiry(&t.env),
         );
@@ -1566,8 +1933,11 @@ fn conditional_order_limit_is_enforced() {
 
     // The 51st live conditional order for this user/token is rejected.
     let res = t.market.try_place_conditional_order(
-        &owner, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &75i128, &10i128,
+        &owner,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &75i128,
+        &10i128,
         &OrderCondition::StopLoss(1i128),
         &future_expiry(&t.env),
     );
@@ -1582,10 +1952,584 @@ fn conditional_order_without_escrow_funds_panics() {
 
     // No RWA balance to escrow → liquidity/balance check rejects the order.
     let res = t.market.try_place_conditional_order(
-        &broke, &t.token.address, &Symbol::new(&t.env, "sell"),
-        &75i128, &50i128,
+        &broke,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &75i128,
+        &50i128,
         &OrderCondition::StopLoss(80i128),
         &future_expiry(&t.env),
     );
     assert!(res.is_err());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issues #147-#150: circuit breaker, fee tiers, self-trade guard, price oracle
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Assert that a `try_*` market call failed with a specific contract error.
+fn assert_market_error<T>(res: Result<T, Result<SdkError, InvokeError>>, expected: MarketError) {
+    let err = res
+        .err()
+        .expect("expected the call to fail")
+        .expect("expected a contract error, got a host error");
+    assert_eq!(err.get_code(), expected as u32);
+}
+
+/// Execute a limit order and settle it immediately, establishing a VWAP.
+fn trade_at(t: &TestEnv, buyer: &Address, seller: &Address, price: i128, amount: i128) {
+    let order_id = t.market.place_order(
+        buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &price,
+        &amount,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    t.market.fill_order(seller, &order_id, &amount);
+}
+
+// ── Issue #149: self-trade prevention ────────────────────────────────────────
+
+#[test]
+fn fill_order_rejects_self_trade() {
+    let t = setup();
+    let trader = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&trader, &10_000i128);
+    t.token.transfer(&t.admin, &trader, &100i128);
+
+    let order_id = t.market.place_order(
+        &trader,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &10i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+
+    // The maker may not fill their own resting order (wash trading).
+    assert_market_error(
+        t.market.try_fill_order(&trader, &order_id, &50i128),
+        MarketError::SelfTrade,
+    );
+
+    // A different trader can fill it normally.
+    let other = Address::generate(&t.env);
+    base_admin.mint(&other, &10_000i128);
+    t.market.fill_order(&other, &order_id, &50i128);
+    assert_eq!(t.token.get_balance(&other).amount, 50);
+}
+
+#[test]
+fn market_order_never_matches_own_resting_order() {
+    let t = setup();
+    let maker = Address::generate(&t.env);
+    let other = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&maker, &1_000_000i128);
+    t.token.transfer(&t.admin, &maker, &100i128);
+    t.token.transfer(&t.admin, &other, &100i128);
+
+    // The maker's ask ranks first (best price, earliest arrival)...
+    t.market.place_order(
+        &maker,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &30i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    let other_ask = t.market.place_order(
+        &other,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &20i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+
+    // ...so a market buy from the maker must skip its own order.
+    let filled = t.market.place_market_order(
+        &maker,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &20i128,
+        &100i128,
+    );
+    assert_eq!(filled, 20);
+
+    // The other seller's order is consumed; the maker's own ask still rests.
+    assert!(t.market.try_fill_order(&other, &other_ask, &1i128).is_err());
+    let book = t.market.get_order_book(&t.token.address);
+    assert_eq!(book.asks.len(), 1);
+    assert_eq!(book.asks.get(0).unwrap().total_amount, 30);
+    assert_eq!(book.asks.get(0).unwrap().order_count, 1);
+}
+
+// ── Issue #147: circuit breaker ──────────────────────────────────────────────
+
+fn tripped_test_env() -> (TestEnv, Address, Address) {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+
+    t.market.set_circuit_breaker_config(
+        &t.admin,
+        &CircuitBreakerConfig {
+            threshold_bps: 500, // 5%
+            cooldown_seconds: 300,
+            auto_reset: true,
+        },
+    );
+
+    // Establish a VWAP of 100.
+    trade_at(&t, &buyer, &seller, 100, 50);
+    (t, buyer, seller)
+}
+
+/// Trade 10 units at `price` with the tripped-test buyer/seller pair.
+fn trade_after_trip(t: &TestEnv, buyer: &Address, seller: &Address, price: i128) {
+    let order_id = t.market.place_order(
+        buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &price,
+        &10i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    t.market.fill_order(seller, &order_id, &10i128);
+}
+
+#[test]
+fn circuit_breaker_trips_on_price_deviation() {
+    let (t, buyer, seller) = tripped_test_env();
+    assert_eq!(t.market.get_vwap(&t.token.address), 100);
+
+    let config = t.market.get_circuit_breaker_config();
+    assert_eq!(config.threshold_bps, 500);
+    assert_eq!(config.cooldown_seconds, 300);
+    assert!(config.auto_reset);
+
+    // A trade 30% away from VWAP trips the breaker (threshold is 5%).
+    trade_after_trip(&t, &buyer, &seller, 130);
+
+    let state = t.market.get_circuit_breaker_state(&t.token.address);
+    assert!(state.is_tripped);
+    assert_eq!(state.trip_price, 130);
+    assert_eq!(state.reference_price, 100);
+    assert!(t.market.is_circuit_breaker_tripped(&t.token.address));
+
+    // The trigger is recorded, not raised, so the trade settled...
+    assert_eq!(t.token.get_balance(&buyer).amount, 60);
+
+    // ...but every new order is now rejected for the cooldown window.
+    assert_market_error(
+        t.market.try_place_order(
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &100i128,
+            &10i128,
+            &future_expiry(&t.env),
+            &0i128,
+        ),
+        MarketError::CircuitBreakerTripped,
+    );
+}
+
+#[test]
+fn circuit_breaker_cooldown_rejects_new_orders() {
+    let (t, buyer, seller) = tripped_test_env();
+    trade_after_trip(&t, &buyer, &seller, 130);
+    assert!(t.market.is_circuit_breaker_tripped(&t.token.address));
+
+    // Even a price back at the reference is rejected while the cooldown runs.
+    assert_market_error(
+        t.market.try_place_order(
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &100i128,
+            &50i128,
+            &future_expiry(&t.env),
+            &0i128,
+        ),
+        MarketError::CircuitBreakerTripped,
+    );
+    assert!(t.market.is_circuit_breaker_tripped(&t.token.address));
+
+    // Market orders are rejected too.
+    assert_market_error(
+        t.market.try_place_market_order(
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &10i128,
+            &130i128,
+        ),
+        MarketError::CircuitBreakerTripped,
+    );
+}
+
+#[test]
+fn circuit_breaker_auto_resets_after_cooldown() {
+    let (t, buyer, seller) = tripped_test_env();
+    trade_after_trip(&t, &buyer, &seller, 130);
+    assert!(t.market.is_circuit_breaker_tripped(&t.token.address));
+
+    // Cooldown is 300s: just before it elapses the breaker is still closed.
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 299);
+    assert!(t
+        .market
+        .try_place_order(
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &100i128,
+            &10i128,
+            &future_expiry(&t.env),
+            &0i128,
+        )
+        .is_err());
+
+    // Once the cooldown elapses and the submitted price is stable it clears
+    // itself and the order is accepted.
+    t.env.ledger().set_timestamp(t.env.ledger().timestamp() + 2);
+    let order_id = t.market.place_order(
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &105i128,
+        &10i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    assert!(order_id > 0);
+    assert!(!t.market.is_circuit_breaker_tripped(&t.token.address));
+}
+
+#[test]
+fn circuit_breaker_manual_force_reset() {
+    let (t, buyer, seller) = tripped_test_env();
+
+    // Auto-reset disabled: the breaker must be cleared manually.
+    t.market.set_circuit_breaker_config(
+        &t.admin,
+        &CircuitBreakerConfig {
+            threshold_bps: 500,
+            cooldown_seconds: 300,
+            auto_reset: false,
+        },
+    );
+    trade_after_trip(&t, &buyer, &seller, 130);
+    assert!(t.market.is_circuit_breaker_tripped(&t.token.address));
+
+    // Long past the cooldown, still tripped because auto-reset is off.
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 10_000);
+    assert!(t
+        .market
+        .try_place_order(
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &105i128,
+            &10i128,
+            &future_expiry(&t.env),
+            &0i128,
+        )
+        .is_err());
+
+    // Admin force-reset clears it.
+    t.market
+        .force_reset_circuit_breaker(&t.admin, &t.token.address);
+    assert!(!t.market.is_circuit_breaker_tripped(&t.token.address));
+
+    let order_id = t.market.place_order(
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &105i128,
+        &10i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    assert!(order_id > 0);
+}
+
+// ── Issue #148: 30-day volume fee tiers ──────────────────────────────────────
+
+#[test]
+fn default_fee_tiers_follow_volume_ladder() {
+    let t = setup();
+    let tiers = t.market.get_fee_tiers();
+    assert_eq!(tiers.len(), 4);
+
+    assert_eq!(tiers.get(0).unwrap().min_30d_volume, 0);
+    assert_eq!(tiers.get(0).unwrap().taker_fee_bps, 30);
+    assert_eq!(tiers.get(1).unwrap().min_30d_volume, 100_000);
+    assert_eq!(tiers.get(1).unwrap().maker_fee_bps, 20);
+    assert_eq!(tiers.get(2).unwrap().min_30d_volume, 1_000_000);
+    assert_eq!(tiers.get(2).unwrap().taker_fee_bps, 15);
+    assert_eq!(tiers.get(3).unwrap().min_30d_volume, 10_000_000);
+    assert_eq!(tiers.get(3).unwrap().maker_fee_bps, 10);
+
+    // A new trader starts with no volume in the lowest tier.
+    let fresh = Address::generate(&t.env);
+    assert_eq!(t.market.get_30d_volume(&fresh), 0);
+    assert_eq!(t.market.get_fee_tier(&fresh).min_30d_volume, 0);
+}
+
+#[test]
+fn fee_tier_upgrades_and_downgrades_with_rolling_volume() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &500_000i128);
+
+    // Activate the tiered fee schedule.
+    let tiers = t.market.get_fee_tiers();
+    t.market.set_fee_tiers(&t.admin, &tiers);
+
+    // 99_990 of volume stays below the first boundary.
+    trade_at(&t, &buyer, &seller, 1, 99_990);
+    assert_eq!(t.market.get_30d_volume(&seller), 99_990);
+    assert_eq!(t.market.get_fee_tier(&seller).taker_fee_bps, 30);
+
+    // Crossing 100_000 moves the trader up a tier.
+    trade_at(&t, &buyer, &seller, 1, 10);
+    assert_eq!(t.market.get_30d_volume(&seller), 100_000);
+    assert_eq!(t.market.get_fee_tier(&seller).min_30d_volume, 100_000);
+    assert_eq!(t.market.get_fee_tier(&seller).taker_fee_bps, 20);
+
+    // Volume older than the 30-day window rolls off, downgrading the trader.
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 30 * 24 * 60 * 60 + 1);
+    assert_eq!(t.market.get_30d_volume(&seller), 0);
+    assert_eq!(t.market.get_fee_tier(&seller).taker_fee_bps, 30);
+}
+
+#[test]
+fn tiered_maker_and_taker_fees_applied_at_execution() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+
+    // One explicit tier: 1% maker fee, 2% taker fee.
+    t.market.set_fee_tiers(
+        &t.admin,
+        &Vec::from_array(
+            &t.env,
+            [FeeTier {
+                min_30d_volume: 0,
+                maker_fee_bps: 100,
+                taker_fee_bps: 200,
+            }],
+        ),
+    );
+
+    let recipient_before = t.base_token.balance(&t.admin);
+    let seller_before = t.base_token.balance(&seller);
+
+    // Maker (buyer) buys 100 @ 10 = 1000 settlement value.
+    let order_id = t.market.place_order(
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &10i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    t.market.fill_order(&seller, &order_id, &100i128);
+
+    // Maker fee 10 + taker fee 20 goes to the fee recipient.
+    assert_eq!(t.base_token.balance(&t.admin), recipient_before + 30);
+    // The taker receives the settlement net of both fees.
+    assert_eq!(t.base_token.balance(&seller), seller_before + 970);
+}
+
+// ── Issue #150: price oracle integration ─────────────────────────────────────
+
+#[test]
+fn oracle_price_validates_order_price() {
+    let t = setup();
+    let oracle = Address::generate(&t.env);
+    let buyer = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+
+    t.market
+        .set_price_oracle(&t.admin, &t.token.address, &oracle);
+    t.market
+        .set_oracle_price(&oracle, &t.token.address, &100i128, &5i128);
+
+    let entry = t.market.get_oracle_price(&t.token.address).unwrap();
+    assert_eq!(entry.price, 100);
+    assert_eq!(entry.confidence_interval, 5);
+    assert_eq!(entry.oracle_address, oracle);
+    assert_eq!(entry.token, t.token.address);
+    assert_eq!(
+        t.market.get_configured_oracle(&t.token.address).unwrap(),
+        oracle
+    );
+
+    // 5% from the oracle is inside the market's 20% band.
+    let order_id = t.market.place_order(
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &105i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    assert!(order_id > 0);
+
+    // 100% from the oracle is rejected, and the VWAP breaker stays untouched
+    // because the oracle was authoritative.
+    assert_market_error(
+        t.market.try_place_order(
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &200i128,
+            &50i128,
+            &future_expiry(&t.env),
+            &0i128,
+        ),
+        MarketError::OraclePriceDeviation,
+    );
+    assert!(!t.market.is_circuit_breaker_tripped(&t.token.address));
+}
+
+#[test]
+fn stale_oracle_falls_back_to_vwap() {
+    let t = setup();
+    let oracle = Address::generate(&t.env);
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+
+    t.market
+        .set_price_oracle(&t.admin, &t.token.address, &oracle);
+    t.market
+        .set_oracle_price(&oracle, &t.token.address, &100i128, &1i128);
+
+    // Age the oracle past its one-hour freshness window...
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 7200);
+
+    // ...and establish a VWAP of 200 with a real trade.
+    trade_at(&t, &buyer, &seller, 200, 50);
+    assert_eq!(t.market.get_vwap(&t.token.address), 200);
+
+    // 115 is only 15% from the (stale) oracle but 42.5% from VWAP: the stale
+    // price must be ignored in favour of the VWAP reference.
+    assert_market_error(
+        t.market.try_place_order(
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &115i128,
+            &50i128,
+            &future_expiry(&t.env),
+            &0i128,
+        ),
+        MarketError::OraclePriceDeviation,
+    );
+
+    // A price close to VWAP is still accepted while the oracle is stale.
+    let order_id = t.market.place_order(
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &205i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    assert!(order_id > 0);
+}
+
+#[test]
+fn oracle_price_requires_configured_oracle_auth() {
+    let t = setup();
+    let oracle = Address::generate(&t.env);
+    let attacker = Address::generate(&t.env);
+
+    t.market
+        .set_price_oracle(&t.admin, &t.token.address, &oracle);
+
+    // Only the configured oracle may publish a price.
+    assert_market_error(
+        t.market
+            .try_set_oracle_price(&attacker, &t.token.address, &100i128, &1i128),
+        MarketError::Unauthorized,
+    );
+
+    // Only the admin may configure an oracle.
+    assert_market_error(
+        t.market
+            .try_set_price_oracle(&attacker, &t.token.address, &attacker),
+        MarketError::Unauthorized,
+    );
+
+    // A token with no configured oracle cannot receive prices.
+    let other_token = Address::generate(&t.env);
+    assert_market_error(
+        t.market
+            .try_set_oracle_price(&oracle, &other_token, &100i128, &1i128),
+        MarketError::Unauthorized,
+    );
+}
+
+#[test]
+fn no_oracle_configured_skips_oracle_validation() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &1_000i128);
+
+    assert!(t.market.get_oracle_price(&t.token.address).is_none());
+    assert!(t.market.get_configured_oracle(&t.token.address).is_none());
+
+    trade_at(&t, &buyer, &seller, 100, 50);
+
+    // With no oracle configured there is no external reference to validate
+    // against: a far-out limit order simply rests on the book.
+    let order_id = t.market.place_order(
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &200i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    assert!(order_id > 0);
+    assert!(!t.market.is_circuit_breaker_tripped(&t.token.address));
 }

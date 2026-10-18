@@ -2104,3 +2104,32 @@ impl CustodyValidator {
         (page, next_cursor)
     }
 }
+
+// ── Issue #150: shared price-oracle helpers ──────────────────────────────────
+//
+// Both the custody validator (fair-value checks on attested collateral) and the
+// secondary market (order validation) need to agree on when an oracle price is
+// trustworthy. These helpers are the single source of truth for that policy.
+
+/// Default maximum age of an oracle price before it is considered stale.
+pub const PRICE_ORACLE_MAX_AGE_SECONDS: u64 = 3600;
+
+/// True when `timestamp` is no older than `max_age_seconds` relative to `now`.
+/// A timestamp in the future is never considered fresh.
+pub fn is_oracle_price_fresh(timestamp: u64, now: u64, max_age_seconds: u64) -> bool {
+    now >= timestamp && now - timestamp <= max_age_seconds
+}
+
+/// Absolute difference between `price` and `reference` expressed in basis
+/// points of the reference. Returns 0 when the reference is not positive.
+pub fn price_deviation_bps(price: i128, reference: i128) -> i128 {
+    if reference <= 0 {
+        return 0;
+    }
+    let deviation = if price >= reference {
+        price - reference
+    } else {
+        reference - price
+    };
+    (deviation * 10000) / reference
+}
