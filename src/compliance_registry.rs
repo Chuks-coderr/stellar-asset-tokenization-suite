@@ -5,6 +5,13 @@ use soroban_sdk::{
 
 const STORAGE_VERSION: u32 = 1;
 
+/// The number of seconds in a UTC day.
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// How long before its expiry a KYC record enters the warning state
+/// (Issue #111).
+const KYC_WARNING_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum ComplianceError {
@@ -32,6 +39,21 @@ pub struct KYCStatus {
     pub is_accredited: bool,
     pub risk_score: u32,
     pub aml_flags: Vec<Symbol>,
+}
+
+/// The effective KYC state of a participant (Issue #111).
+///
+/// - `Active`  — verified and still comfortably within its validity period.
+/// - `Warning` — verified, but the record expires within the warning window.
+/// - `Expired` — not verified, or the expiry date has passed.
+/// - `Revoked` — the address is on the blacklist.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KycState {
+    Active = 0,
+    Warning = 1,
+    Expired = 2,
+    Revoked = 3,
 }
 
 #[contracttype]
@@ -64,6 +86,40 @@ pub struct ComplianceRule {
 // ... (around line 58)
 #[contract]
 pub struct ComplianceRegistry;
+
+/// The UTC calendar year and month (1-12) a timestamp falls in.
+///
+/// Hinnant's `civil_from_days` algorithm: days since the Unix epoch are
+/// converted to a civil date. Used by the calendar-aligned transfer-limit
+/// resets (Issue #113).
+fn utc_calendar(timestamp: u64) -> (i64, u32) {
+    let z = (timestamp / SECONDS_PER_DAY) as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;                                     // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);                // [0, 365]
+    let mp = (5 * doy + 2) / 153;                                    // [0, 11]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };                    // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m as u32)
+}
+
+/// The UTC day a timestamp falls in (Issue #113).
+fn utc_day(timestamp: u64) -> u64 {
+    timestamp / SECONDS_PER_DAY
+}
+
+/// The UTC calendar month a timestamp falls in, as `year * 12 + (month - 1)`
+/// (Issue #113).
+fn utc_month_index(timestamp: u64) -> u32 {
+    let (year, month) = utc_calendar(timestamp);
+    (year as u32) * 12 + (month - 1)
+}
+
+/// The UTC calendar year a timestamp falls in (Issue #113).
+fn utc_year_index(timestamp: u64) -> u32 {
+    utc_calendar(timestamp).0 as u32
+}
 
 #[contractimpl]
 
@@ -176,7 +232,7 @@ impl ComplianceRegistry {
     }
 
     pub fn get_kyc_status(env: Env, user: Address) -> KYCStatus {
-        env.storage().instance().get(&user).unwrap_or(KYCStatus {
+        let mut kyc: KYCStatus = env.storage().instance().get(&user).unwrap_or(KYCStatus {
             is_verified: false,
             verification_level: 0,
             expiry_date: 0,
@@ -184,7 +240,60 @@ impl ComplianceRegistry {
             is_accredited: false,
             risk_score: 5,
             aml_flags: Vec::new(&env),
-        })
+        });
+
+        // Issue #111 — report the *effective* state: a record that has
+        // expired or been revoked is not verified any more, even though the
+        // stored record still says it is.
+        match Self::get_effective_kyc_state(env.clone(), user.clone()) {
+            KycState::Expired | KycState::Revoked => kyc.is_verified = false,
+            _ => {}
+        }
+
+        kyc
+    }
+
+    /// The effective KYC state of `user` (Issue #111).
+    ///
+    /// - `Revoked` — the address is on the blacklist.
+    /// - `Expired` — the record is not verified, or its expiry date has
+    ///   passed (an expiry date of 0 means "never set", which is expired).
+    /// - `Warning` — the record expires within the warning window.
+    /// - `Active`  — the record is verified and still comfortably valid.
+    pub fn get_effective_kyc_state(env: Env, user: Address) -> KycState {
+        let blacklist: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "blacklist"))
+            .unwrap_or(Vec::new(&env));
+
+        if blacklist.iter().any(|a| a.clone() == user) {
+            return KycState::Revoked;
+        }
+
+        let kyc: KYCStatus = env.storage().instance().get(&user).unwrap_or(KYCStatus {
+            is_verified: false,
+            verification_level: 0,
+            expiry_date: 0,
+            jurisdiction: Symbol::new(&env, "UNKNOWN"),
+            is_accredited: false,
+            risk_score: 5,
+            aml_flags: Vec::new(&env),
+        });
+
+        if !kyc.is_verified {
+            return KycState::Expired;
+        }
+
+        let now = env.ledger().timestamp();
+        if kyc.expiry_date == 0 || kyc.expiry_date < now {
+            return KycState::Expired;
+        }
+        if kyc.expiry_date - now <= KYC_WARNING_WINDOW_SECONDS {
+            return KycState::Warning;
+        }
+
+        KycState::Active
     }
 
     pub fn add_to_blacklist(env: Env, auth: Address, address: Address, reason: Symbol) {
@@ -544,7 +653,7 @@ impl ComplianceRegistry {
             .get(&map_key)
             .unwrap_or(Map::new(&env));
 
-        let mut limits: TransferLimits = map.get(user.clone()).unwrap_or(TransferLimits {
+        let limits: TransferLimits = map.get(user.clone()).unwrap_or(TransferLimits {
             daily_limit: 10000,
             monthly_limit: 100000,
             annual_limit: 1000000,
@@ -557,24 +666,7 @@ impl ComplianceRegistry {
         });
 
         let current_time = env.ledger().timestamp();
-        let day_in_seconds = 86400;
-        let month_in_seconds = 30 * day_in_seconds;
-        let year_in_seconds = 365 * day_in_seconds;
-
-        if current_time - limits.last_reset_daily >= day_in_seconds {
-            limits.remaining_daily = limits.daily_limit;
-            limits.last_reset_daily = current_time;
-        }
-
-        if current_time - limits.last_reset_monthly >= month_in_seconds {
-            limits.remaining_monthly = limits.monthly_limit;
-            limits.last_reset_monthly = current_time;
-        }
-
-        if current_time - limits.last_reset_annual >= year_in_seconds {
-            limits.remaining_annual = limits.annual_limit;
-            limits.last_reset_annual = current_time;
-        }
+        let mut limits = Self::effective_limits(&env, limits, &user, current_time);
 
         if amount > limits.remaining_daily
             || amount > limits.remaining_monthly
@@ -602,7 +694,7 @@ impl ComplianceRegistry {
             .get(&map_key)
             .unwrap_or(Map::new(&env));
 
-        let limits: TransferLimits = map.get(user).unwrap_or(TransferLimits {
+        let limits: TransferLimits = map.get(user.clone()).unwrap_or(TransferLimits {
             daily_limit: 10000,
             monthly_limit: 100000,
             annual_limit: 1000000,
@@ -615,28 +707,55 @@ impl ComplianceRegistry {
         });
 
         let current_time = env.ledger().timestamp();
-        let day_in_seconds: u64 = 86400;
-        let month_in_seconds: u64 = 30 * day_in_seconds;
-        let year_in_seconds: u64 = 365 * day_in_seconds;
+        let limits = Self::effective_limits(&env, limits, &user, current_time);
 
-        // Compute effective remaining after potential resets (without writing)
-        let effective_daily = if current_time - limits.last_reset_daily >= day_in_seconds {
-            limits.daily_limit
-        } else {
-            limits.remaining_daily
-        };
-        let effective_monthly = if current_time - limits.last_reset_monthly >= month_in_seconds {
-            limits.monthly_limit
-        } else {
-            limits.remaining_monthly
-        };
-        let effective_annual = if current_time - limits.last_reset_annual >= year_in_seconds {
-            limits.annual_limit
-        } else {
-            limits.remaining_annual
-        };
+        amount <= limits.remaining_daily && amount <= limits.remaining_monthly && amount <= limits.remaining_annual
+    }
 
-        amount <= effective_daily && amount <= effective_monthly && amount <= effective_annual
+    /// Applies the calendar-aligned resets to `limits` (Issue #113).
+    ///
+    /// The daily window rolls over at 00:00 UTC, the monthly one on the 1st
+    /// and the annual one on 1 January. The stored `last_reset_*` values stay
+    /// timestamps and are compared by calendar period, so rows written before
+    /// this change keep working without a migration.
+    fn apply_calendar_resets(limits: &mut TransferLimits, current_time: u64) {
+        if utc_day(current_time) != utc_day(limits.last_reset_daily) {
+            limits.remaining_daily = limits.daily_limit;
+            limits.last_reset_daily = current_time;
+        }
+
+        if utc_month_index(current_time) != utc_month_index(limits.last_reset_monthly) {
+            limits.remaining_monthly = limits.monthly_limit;
+            limits.last_reset_monthly = current_time;
+        }
+
+        if utc_year_index(current_time) != utc_year_index(limits.last_reset_annual) {
+            limits.remaining_annual = limits.annual_limit;
+            limits.last_reset_annual = current_time;
+        }
+    }
+
+    /// The limits that apply to `user` at `current_time` (Issues #111, #113).
+    ///
+    /// The calendar-aligned resets are applied, and a participant whose KYC
+    /// is inside the warning window is capped at half of their normal limits.
+    fn effective_limits(
+        env: &Env,
+        mut limits: TransferLimits,
+        user: &Address,
+        current_time: u64,
+    ) -> TransferLimits {
+        Self::apply_calendar_resets(&mut limits, current_time);
+
+        // Issue #111 — a participant whose KYC is inside the warning window
+        // may still transfer, but only up to half of their normal limit.
+        if Self::get_effective_kyc_state(env.clone(), user.clone()) == KycState::Warning {
+            limits.remaining_daily = limits.remaining_daily.min(limits.daily_limit / 2);
+            limits.remaining_monthly = limits.remaining_monthly.min(limits.monthly_limit / 2);
+            limits.remaining_annual = limits.remaining_annual.min(limits.annual_limit / 2);
+        }
+
+        limits
     }
 
     pub fn set_transfer_limits(env: Env, auth: Address, user: Address, limits: TransferLimits) {
