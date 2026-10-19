@@ -14,3 +14,15 @@ PR_ISSUE_19.md
 PR_ISSUE_20.md
 PR_ISSUE_21.md
 AGENTS.md
+
+# Test snapshots
+**/*.snap
+*.snap
+__snapshots__/
+
+# Coverage artefacts
+coverage/
+*.profraw
+*.profdata
+lcov.info
+cobertura.xml

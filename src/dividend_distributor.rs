@@ -1,6 +1,6 @@
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token::TokenClient, Address, Env, Map,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token::TokenClient,
+    Address, Env, Map, Symbol, Vec,
 };
 
 use crate::rwa_token::RWATokenClient;
@@ -15,6 +15,12 @@ pub const DEFAULT_MIN_CLAIM_WINDOW: u64 = 3600;
 /// Proposal key used by the governance committee to authorise lifting an
 /// emergency freeze (`freeze_all_distributions`). See issue #139.
 pub const UNFREEZE_PROPOSAL_KEY: &str = "unfreeze_distributions";
+
+// ── Issue #127: Boost tier lock duration constants ───────────────────────────
+pub const BOOST_TIER_30D: u64 = 30 * 24 * 3600;  // 1.1x => 1_100_000
+pub const BOOST_TIER_90D: u64 = 90 * 24 * 3600;  // 1.5x => 1_500_000
+pub const BOOST_TIER_180D: u64 = 180 * 24 * 3600; // 2.0x => 2_000_000
+pub const BOOST_TIER_365D: u64 = 365 * 24 * 3600; // 3.0x => 3_000_000
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -46,6 +52,8 @@ pub enum DividendError {
     InvalidGovernanceProposal = 24,
 }
 
+/// Issue #126: DividendDistribution now carries `start_time` and `end_time`
+/// for time-weighted pro-rata calculations.
 #[contracttype]
 #[derive(Clone)]
 pub struct DividendDistribution {
@@ -59,6 +67,10 @@ pub struct DividendDistribution {
     pub created_at: u64,
     pub is_active: bool,
     pub metadata: Map<Symbol, Symbol>,
+    /// Issue #126: accrual period start (= created_at).
+    pub start_time: u64,
+    /// Issue #126: accrual period end (= claim_deadline).
+    pub end_time: u64,
 }
 
 #[contracttype]
@@ -111,6 +123,19 @@ pub struct DividendConfig {
     pub min_claim_window: u64,
 }
 
+/// Issue #127: Per-token boost configuration for yield farming multipliers.
+#[contracttype]
+#[derive(Clone)]
+pub struct BoostConfig {
+    /// Base multiplier expressed as fixed-point 1_000_000 = 1×.
+    pub base_rate: i128,
+    /// Additional multiplier per lock tier (informational; tiers are
+    /// hard-coded as constants above).
+    pub lock_boost_multiplier: i128,
+    /// Maximum allowed multiplier, e.g. 3_000_000 = 3×.
+    pub max_boost: i128,
+}
+
 #[contract]
 pub struct DividendDistributor;
 
@@ -148,9 +173,11 @@ impl DividendDistributor {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "distribution_count"), &0u64);
+        // Issue #130: store distributions as Map<u64, DividendDistribution>
+        // for O(1) lookup instead of O(n) Vec scan.
         env.storage().instance().set(
             &Symbol::new(&env, "distributions"),
-            &Vec::<DividendDistribution>::new(&env),
+            &Map::<u64, DividendDistribution>::new(&env),
         );
         env.storage().instance().set(
             &Symbol::new(&env, "currency_tokens"),
@@ -161,19 +188,30 @@ impl DividendDistributor {
             .set(&Symbol::new(&env, "last_auto_distribution_at"), &0u64);
         env.storage()
             .instance()
-            .set(&Symbol::new(&env, "clm_tot"),             &Map::<u64, i128>::new(&env));
-        env.storage()
-            .instance()
-            .set(
-                &Symbol::new(&env, "accruals"),
-                &Map::<Address, AccrualRate>::new(&env),
-            );
-        env.storage()
-            .instance()
-            .set(
-                &Symbol::new(&env, "registered_tokens"),
-                &Vec::<Address>::new(&env),
-            );
+            .set(&Symbol::new(&env, "clm_tot"), &Map::<u64, i128>::new(&env));
+        env.storage().instance().set(
+            &Symbol::new(&env, "accruals"),
+            &Map::<Address, AccrualRate>::new(&env),
+        );
+        env.storage().instance().set(
+            &Symbol::new(&env, "registered_tokens"),
+            &Vec::<Address>::new(&env),
+        );
+        // Issue #126: holder snapshot map (Address -> timestamp).
+        env.storage().instance().set(
+            &Symbol::new(&env, "holder_snap"),
+            &Map::<Address, u64>::new(&env),
+        );
+        // Issue #127: per-token boost configs (Address -> BoostConfig).
+        env.storage().instance().set(
+            &Symbol::new(&env, "boost_configs"),
+            &Map::<Address, BoostConfig>::new(&env),
+        );
+        // Issue #127: per-holder registered lock durations (Address -> u64 seconds).
+        env.storage().instance().set(
+            &Symbol::new(&env, "lock_durations"),
+            &Map::<Address, u64>::new(&env),
+        );
         // Issue #139: no emergency freeze is active at deployment time.
         env.storage()
             .instance()
@@ -299,7 +337,9 @@ impl DividendDistributor {
             .storage()
             .instance()
             .get(&Symbol::new(&env, "config"))
-            .unwrap_or_else(|| { panic_with_error!(&env, DividendError::ConfigNotFound); });
+            .unwrap_or_else(|| {
+                panic_with_error!(&env, DividendError::ConfigNotFound);
+            });
 
         if !config.auto_distribute {
             panic_with_error!(&env, DividendError::AutoDistributionDisabled);
@@ -364,12 +404,12 @@ impl DividendDistributor {
             .storage()
             .instance()
             .get(&Symbol::new(&env, "config"))
-            .unwrap_or_else(|| { panic_with_error!(&env, DividendError::ConfigNotFound); });
+            .unwrap_or_else(|| {
+                panic_with_error!(&env, DividendError::ConfigNotFound);
+            });
 
         // Issue #132 — require a minimum claim window so distributions cannot
         // be created with a deadline holders cannot realistically meet.
-        // `saturating_sub` keeps this panic-free even if the ledger timestamp
-        // ever moved backwards between the check above and here.
         if claim_deadline.saturating_sub(now) < config.min_claim_window {
             panic_with_error!(&env, DividendError::ClaimDeadlineTooSoon);
         }
@@ -389,11 +429,12 @@ impl DividendDistributor {
         let rwa_client = RWATokenClient::new(&env, &token_address);
         let total_supply = rwa_client.get_token_info().total_supply;
 
+        // Issue #128: reject distributions when the token has no supply.
         if total_supply == 0 {
             panic_with_error!(&env, DividendError::ZeroTotalSupply);
         }
 
-        let per_token_amount = (amount * 1000000000000000000i128) / total_supply;
+        let per_token_amount = (amount * 1_000_000_000_000_000_000i128) / total_supply;
 
         let distribution_count: u64 = env
             .storage()
@@ -403,6 +444,10 @@ impl DividendDistributor {
 
         let distribution_id = distribution_count + 1;
 
+        // Issue #126: record start/end times for time-weighted calculations.
+        let start_time = now;
+        let end_time = claim_deadline;
+
         let distribution = DividendDistribution {
             distribution_id,
             token_address: token_address.clone(),
@@ -411,18 +456,20 @@ impl DividendDistributor {
             per_token_amount,
             total_supply,
             claim_deadline,
-            created_at: env.ledger().timestamp(),
+            created_at: now,
             is_active: true,
             metadata,
+            start_time,
+            end_time,
         };
 
-        let mut distributions: Vec<DividendDistribution> = env
+        // Issue #130: use Map<u64, DividendDistribution> for O(1) access.
+        let mut distributions: Map<u64, DividendDistribution> = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "distributions"))
-            .unwrap_or(Vec::new(&env));
-
-        distributions.push_back(distribution);
+            .unwrap_or(Map::new(&env));
+        distributions.set(distribution_id, distribution);
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "distributions"), &distributions);
@@ -436,18 +483,211 @@ impl DividendDistributor {
 
         currency_client.transfer(&auth, &env.current_contract_address(), &amount);
 
-        // Track the token so portfolio-wide claims can iterate all held assets
+        // Track the token so portfolio-wide claims can iterate all held assets.
         Self::register_token_internal(env.clone(), token_address.clone());
 
         env.events().publish(
             (Symbol::new(&env, "distribution_created"), token_address),
-            (distribution_id, amount, currency, env.ledger().timestamp()),
+            (distribution_id, amount, currency, now),
         );
 
         distribution_id
     }
 
-    pub fn claim_dividend(env: Env, distribution_id: u64, claimer: Address) -> i128 {
+    // ── Issue #126: Holder snapshot recording ────────────────────────────────
+
+    /// Record the current ledger timestamp as the moment `holder` entered the
+    /// token position.  Call this once when a holder first acquires tokens so
+    /// that `claim_dividend` can apply the correct time-weight.
+    ///
+    /// If not called, `claim_dividend` treats the holder as a full-period
+    /// holder (snapshot_time = start_time ⇒ 100% weight).
+    pub fn record_holding_snapshot(env: Env, holder: Address, token_address: Address) {
+        // The holder (or an admin) must authorise this call to prevent griefing.
+        holder.require_auth();
+
+        // Suppress unused-variable warning; token_address is part of the
+        // public API so that callers can be specific about which token.
+        let _ = token_address;
+
+        let mut snap_map: Map<Address, u64> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "holder_snap"))
+            .unwrap_or(Map::new(&env));
+
+        // Only record the *first* snapshot; subsequent calls are no-ops.
+        if snap_map.get(holder.clone()).is_none() {
+            snap_map.set(holder.clone(), env.ledger().timestamp());
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "holder_snap"), &snap_map);
+        }
+    }
+
+    /// Compute the time-weight (0..=1_000_000) for `holder` relative to the
+    /// given distribution period.
+    ///
+    /// Full-period holders (snapshot ≤ start_time) receive 1_000_000 (100%).
+    /// Holders with no snapshot are treated as full-period holders.
+    fn compute_time_weight(
+        env: &Env,
+        holder: &Address,
+        start_time: u64,
+        end_time: u64,
+        current_time: u64,
+    ) -> i128 {
+        let period_duration = end_time.saturating_sub(start_time);
+        if period_duration == 0 {
+            return 0;
+        }
+
+        let snap_map: Map<Address, u64> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(env, "holder_snap"))
+            .unwrap_or(Map::new(env));
+
+        // Default snapshot = start_time so holders without a snapshot receive
+        // full weight (backwards-compatible behaviour).
+        let snapshot_time = snap_map
+            .get(holder.clone())
+            .unwrap_or(start_time);
+
+        // If the snapshot was recorded before the period started, treat as
+        // full-period holder.
+        let effective_snapshot = if snapshot_time <= start_time {
+            start_time
+        } else {
+            snapshot_time
+        };
+
+        let effective_end = if current_time < end_time {
+            current_time
+        } else {
+            end_time
+        };
+
+        if effective_end <= effective_snapshot {
+            return 0;
+        }
+
+        let holding_duration = effective_end - effective_snapshot;
+        // Fixed-point: max 1_000_000
+        let weight = (holding_duration as i128) * 1_000_000i128 / (period_duration as i128);
+        if weight > 1_000_000 {
+            1_000_000
+        } else {
+            weight
+        }
+    }
+
+    // ── Issue #127: Boost multiplier helpers ──────────────────────────────────
+
+    /// Store per-token boost configuration.  Admin-only.
+    pub fn set_boost_config(env: Env, auth: Address, token_address: Address, config: BoostConfig) {
+        crate::shared_admin::require_admin(&env, &auth);
+        Self::check_version(&env);
+
+        let mut boost_configs: Map<Address, BoostConfig> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "boost_configs"))
+            .unwrap_or(Map::new(&env));
+
+        boost_configs.set(token_address, config);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "boost_configs"), &boost_configs);
+    }
+
+    /// Read per-token boost configuration.
+    pub fn get_boost_config(env: Env, token_address: Address) -> Option<BoostConfig> {
+        let boost_configs: Map<Address, BoostConfig> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "boost_configs"))
+            .unwrap_or(Map::new(&env));
+        boost_configs.get(token_address)
+    }
+
+    /// Register the lock duration (in seconds) for a holder so the distributor
+    /// can compute the correct boost tier without needing a cross-contract call
+    /// into RWAToken's internal lock storage.
+    ///
+    /// The holder or admin should call this immediately after locking tokens.
+    pub fn register_lock_duration(
+        env: Env,
+        holder: Address,
+        token_address: Address,
+        lock_seconds: u64,
+    ) {
+        holder.require_auth();
+
+        // token_address is part of the API; suppress unused-variable warning.
+        let _ = token_address;
+
+        let mut lock_durations: Map<Address, u64> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "lock_durations"))
+            .unwrap_or(Map::new(&env));
+
+        lock_durations.set(holder, lock_seconds);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "lock_durations"), &lock_durations);
+    }
+
+    /// Compute the boost multiplier (fixed-point, 1_000_000 = 1×) for `holder`
+    /// on `token_address`.  Returns 1_000_000 when no lock or no boost config.
+    fn compute_boost_multiplier(env: &Env, holder: Address, token_address: Address) -> i128 {
+        // No boost config registered for this token → no boost.
+        let boost_configs: Map<Address, BoostConfig> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(env, "boost_configs"))
+            .unwrap_or(Map::new(env));
+
+        let config = match boost_configs.get(token_address) {
+            Some(c) => c,
+            None => return 1_000_000,
+        };
+
+        // Look up the holder's registered lock duration.
+        let lock_durations: Map<Address, u64> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(env, "lock_durations"))
+            .unwrap_or(Map::new(env));
+
+        let lock_seconds = lock_durations.get(holder).unwrap_or(0u64);
+
+        let raw_multiplier: i128 = if lock_seconds >= BOOST_TIER_365D {
+            3_000_000
+        } else if lock_seconds >= BOOST_TIER_180D {
+            2_000_000
+        } else if lock_seconds >= BOOST_TIER_90D {
+            1_500_000
+        } else if lock_seconds >= BOOST_TIER_30D {
+            1_100_000
+        } else {
+            1_000_000
+        };
+
+        // Cap at max_boost.
+        if raw_multiplier > config.max_boost {
+            config.max_boost
+        } else {
+            raw_multiplier
+        }
+    }
+
+    /// Claim dividend with yield-farming boost applied.
+    ///
+    /// Identical to `claim_dividend` but multiplies `claimable_amount` by the
+    /// holder's boost multiplier before deducting fees.
+    pub fn claim_boosted_dividend(env: Env, distribution_id: u64, claimer: Address) -> i128 {
         Self::check_version(&env);
 
         // Issue #139: claims are disabled while an emergency freeze is active.
@@ -455,20 +695,16 @@ impl DividendDistributor {
             panic_with_error!(&env, DividendError::DistributionNotActive);
         }
 
-        let distributions: Vec<DividendDistribution> = env
+        // Issue #130: O(1) map lookup.
+        let distributions: Map<u64, DividendDistribution> = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "distributions"))
-            .unwrap_or(Vec::new(&env));
+            .unwrap_or(Map::new(&env));
 
-        let mut found_dist: Option<DividendDistribution> = None;
-        for d in distributions.iter() {
-            if d.distribution_id == distribution_id {
-                found_dist = Some(d.clone());
-                break;
-            }
-        }
-        let distribution = found_dist.unwrap_or_else(|| { panic_with_error!(&env, DividendError::DistributionNotFound); });
+        let distribution = distributions
+            .get(distribution_id)
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::DistributionNotFound));
 
         if !distribution.is_active {
             panic_with_error!(&env, DividendError::DistributionNotActive);
@@ -494,20 +730,26 @@ impl DividendDistributor {
             panic_with_error!(&env, DividendError::NoTokensToClaim);
         }
 
-        let claimable_amount = (balance * distribution.per_token_amount) / 1000000000000000000i128;
+        let base_claimable =
+            (balance * distribution.per_token_amount) / 1_000_000_000_000_000_000i128;
 
-        if claimable_amount <= 0 {
+        if base_claimable <= 0 {
             panic_with_error!(&env, DividendError::NoDividendAvailable);
         }
+
+        // Issue #127: apply boost multiplier.
+        let multiplier =
+            Self::compute_boost_multiplier(&env, claimer.clone(), distribution.token_address.clone());
+        let boosted_amount = (base_claimable * multiplier) / 1_000_000i128;
 
         let config: DividendConfig = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "config"))
-            .unwrap_or_else(|| { panic_with_error!(&env, DividendError::ConfigNotFound); });
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::ConfigNotFound));
 
-        let fee_amount = (claimable_amount * config.fee_rate as i128) / 10000i128;
-        let net_amount = claimable_amount - fee_amount;
+        let fee_amount = (boosted_amount * config.fee_rate as i128) / 10_000i128;
+        let net_amount = boosted_amount - fee_amount;
 
         let dist_currency = distribution.currency.clone();
         let currency_token_address =
@@ -545,6 +787,126 @@ impl DividendDistributor {
         env.storage().instance().set(&tot_key, &totals);
 
         env.events().publish(
+            (Symbol::new(&env, "boosted_dividend_claimed"), claimer),
+            (distribution_id, net_amount, multiplier, dist_currency, current_time),
+        );
+
+        net_amount
+    }
+
+    pub fn claim_dividend(env: Env, distribution_id: u64, claimer: Address) -> i128 {
+        Self::check_version(&env);
+
+        // Issue #139: claims are disabled while an emergency freeze is active.
+        if Self::is_frozen(&env) {
+            panic_with_error!(&env, DividendError::DistributionNotActive);
+        }
+
+        // Issue #130: O(1) map lookup instead of O(n) Vec scan.
+        let distributions: Map<u64, DividendDistribution> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "distributions"))
+            .unwrap_or(Map::new(&env));
+
+        let distribution = distributions
+            .get(distribution_id)
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::DistributionNotFound));
+
+        if !distribution.is_active {
+            panic_with_error!(&env, DividendError::DistributionNotActive);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time > distribution.claim_deadline {
+            panic_with_error!(&env, DividendError::DistributionNotActive);
+        }
+
+        let ck = ClaimKey {
+            distribution_id,
+            claimer: claimer.clone(),
+        };
+        if env.storage().instance().has(&ck) {
+            panic_with_error!(&env, DividendError::AlreadyClaimed);
+        }
+
+        let rwa_client = RWATokenClient::new(&env, &distribution.token_address);
+        let balance = rwa_client.get_balance(&claimer).amount;
+
+        if balance == 0 {
+            panic_with_error!(&env, DividendError::NoTokensToClaim);
+        }
+
+        let claimable_amount =
+            (balance * distribution.per_token_amount) / 1_000_000_000_000_000_000i128;
+
+        if claimable_amount <= 0 {
+            panic_with_error!(&env, DividendError::NoDividendAvailable);
+        }
+
+        // Issue #126: apply time-weighting for partial-period holders.
+        let time_weight = Self::compute_time_weight(
+            &env,
+            &claimer,
+            distribution.start_time,
+            distribution.end_time,
+            current_time,
+        );
+        let time_weighted_amount = (claimable_amount * time_weight) / 1_000_000i128;
+
+        if time_weighted_amount <= 0 {
+            panic_with_error!(&env, DividendError::NoDividendAvailable);
+        }
+
+        let config: DividendConfig = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "config"))
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::ConfigNotFound));
+
+        let fee_amount = (time_weighted_amount * config.fee_rate as i128) / 10_000i128;
+        let net_amount = time_weighted_amount - fee_amount;
+
+        let dist_currency = distribution.currency.clone();
+        let currency_token_address =
+            Self::get_currency_token_address(env.clone(), dist_currency.clone());
+        let currency_client = TokenClient::new(&env, &currency_token_address);
+
+        currency_client.transfer(&env.current_contract_address(), &claimer, &net_amount);
+
+        if fee_amount > 0 {
+            currency_client.transfer(
+                &env.current_contract_address(),
+                &config.fee_recipient,
+                &fee_amount,
+            );
+        }
+
+        let claim_info = ClaimInfo {
+            distribution_id,
+            claimer: claimer.clone(),
+            amount_claimed: net_amount,
+            claimed_at: current_time,
+            currency: dist_currency.clone(),
+        };
+
+        env.storage().instance().set(&ck, &claim_info);
+
+        let tot_key = Symbol::new(&env, "clm_tot");
+        let mut totals: Map<u64, i128> = env
+            .storage()
+            .instance()
+            .get(&tot_key)
+            .unwrap_or(Map::new(&env));
+        let prev = totals.get(distribution_id).unwrap_or(0i128);
+        totals.set(distribution_id, prev + net_amount);
+        env.storage().instance().set(&tot_key, &totals);
+
+        env.events().publish(
+            (Symbol::new(&env, "time_weighted_dividend_claimed"), claimer.clone()),
+            (distribution_id, net_amount, dist_currency.clone(), current_time),
+        );
+        env.events().publish(
             (Symbol::new(&env, "dividend_claimed"), claimer),
             (distribution_id, net_amount, dist_currency, current_time),
         );
@@ -558,16 +920,17 @@ impl DividendDistributor {
             return Vec::new(&env);
         }
 
-        let distributions: Vec<DividendDistribution> = env
+        // Issue #130: iterate map values.
+        let distributions: Map<u64, DividendDistribution> = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "distributions"))
-            .unwrap_or(Vec::new(&env));
+            .unwrap_or(Map::new(&env));
 
         let mut claimed_amounts = Vec::<i128>::new(&env);
         let current_time = env.ledger().timestamp();
 
-        for distribution in distributions.iter() {
+        for (_id, distribution) in distributions.iter() {
             if distribution.is_active && current_time <= distribution.claim_deadline {
                 let ck = ClaimKey {
                     distribution_id: distribution.distribution_id,
@@ -608,7 +971,7 @@ impl DividendDistributor {
             .get(&Symbol::new(&env, "registered_tokens"))
             .unwrap_or(Vec::new(&env));
 
-        // Bound portfolio iteration to a fixed maximum number of tokens
+        // Bound portfolio iteration to a fixed maximum number of tokens.
         let max_tokens: u32 = 20;
         let mut results = Vec::<(Address, i128)>::new(&env);
         let mut processed: u32 = 0;
@@ -641,16 +1004,17 @@ impl DividendDistributor {
             return 0;
         }
 
-        let distributions: Vec<DividendDistribution> = env
+        // Issue #130: iterate map values filtered by token_address.
+        let distributions: Map<u64, DividendDistribution> = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "distributions"))
-            .unwrap_or(Vec::new(&env));
+            .unwrap_or(Map::new(&env));
 
         let mut total: i128 = 0;
         let current_time = env.ledger().timestamp();
 
-        for distribution in distributions.iter() {
+        for (_id, distribution) in distributions.iter() {
             if distribution.token_address != token_address {
                 continue;
             }
@@ -681,31 +1045,30 @@ impl DividendDistributor {
     }
 
     pub fn get_distribution(env: Env, distribution_id: u64) -> DividendDistribution {
-        let distributions: Vec<DividendDistribution> = env
+        // Issue #130: O(1) map lookup.
+        let distributions: Map<u64, DividendDistribution> = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "distributions"))
-            .unwrap_or(Vec::new(&env));
+            .unwrap_or(Map::new(&env));
 
-        for d in distributions.iter() {
-            if d.distribution_id == distribution_id {
-                return d.clone();
-            }
-        }
-        panic_with_error!(&env, DividendError::DistributionNotFound)
+        distributions
+            .get(distribution_id)
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::DistributionNotFound))
     }
 
     pub fn get_active_distributions(env: Env, token_address: Address) -> Vec<DividendDistribution> {
-        let distributions: Vec<DividendDistribution> = env
+        // Issue #130: iterate map values.
+        let distributions: Map<u64, DividendDistribution> = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "distributions"))
-            .unwrap_or(Vec::new(&env));
+            .unwrap_or(Map::new(&env));
 
         let mut active_distributions = Vec::<DividendDistribution>::new(&env);
         let current_time = env.ledger().timestamp();
 
-        for distribution in distributions.iter() {
+        for (_id, distribution) in distributions.iter() {
             if distribution.token_address == token_address
                 && distribution.is_active
                 && current_time <= distribution.claim_deadline
@@ -731,20 +1094,14 @@ impl DividendDistributor {
             return 0;
         }
 
-        let distributions: Vec<DividendDistribution> = env
+        // Issue #130: O(1) map lookup.
+        let distributions: Map<u64, DividendDistribution> = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "distributions"))
-            .unwrap_or(Vec::new(&env));
+            .unwrap_or(Map::new(&env));
 
-        let mut found_dist: Option<DividendDistribution> = None;
-        for d in distributions.iter() {
-            if d.distribution_id == distribution_id {
-                found_dist = Some(d.clone());
-                break;
-            }
-        }
-        let distribution = match found_dist {
+        let distribution = match distributions.get(distribution_id) {
             Some(d) => d,
             None => panic_with_error!(&env, DividendError::DistributionNotFound),
         };
@@ -773,16 +1130,31 @@ impl DividendDistributor {
             return 0;
         }
 
-        let claimable_amount = (balance * distribution.per_token_amount) / 1000000000000000000i128;
+        let claimable_amount =
+            (balance * distribution.per_token_amount) / 1_000_000_000_000_000_000i128;
+
+        // Issue #126: apply time-weighting.
+        let time_weight = Self::compute_time_weight(
+            &env,
+            &claimer,
+            distribution.start_time,
+            distribution.end_time,
+            current_time,
+        );
+        let time_weighted_amount = (claimable_amount * time_weight) / 1_000_000i128;
+
+        if time_weighted_amount <= 0 {
+            return 0;
+        }
 
         let config: DividendConfig = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "config"))
-            .unwrap_or_else(|| { panic_with_error!(&env, DividendError::ConfigNotFound); });
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::ConfigNotFound));
 
-        let fee_amount = (claimable_amount * config.fee_rate as i128) / 10000i128;
-        claimable_amount - fee_amount
+        let fee_amount = (time_weighted_amount * config.fee_rate as i128) / 10_000i128;
+        time_weighted_amount - fee_amount
     }
 
     pub fn update_accrual(
@@ -799,7 +1171,7 @@ impl DividendDistributor {
             .storage()
             .instance()
             .get(&Symbol::new(&env, "config"))
-            .unwrap_or_else(|| { panic_with_error!(&env, DividendError::ConfigNotFound); });
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::ConfigNotFound));
 
         if !config
             .supported_currencies
@@ -871,17 +1243,18 @@ impl DividendDistributor {
         };
         let last_claimed: i128 = env.storage().instance().get(&ack).unwrap_or(0i128);
 
-        let gross_amount = (balance * (accrued_total - last_claimed)) / 1000000000000000000i128;
+        let gross_amount = (balance * (accrued_total - last_claimed)) / 1_000_000_000_000_000_000i128;
         if gross_amount <= 0 {
             return 0;
         }
 
-        let config: DividendConfig = match env.storage().instance().get(&Symbol::new(&env, "config")) {
-            Some(c) => c,
-            None => return 0,
-        };
+        let config: DividendConfig =
+            match env.storage().instance().get(&Symbol::new(&env, "config")) {
+                Some(c) => c,
+                None => return 0,
+            };
 
-        let fee_amount = (gross_amount * config.fee_rate as i128) / 10000i128;
+        let fee_amount = (gross_amount * config.fee_rate as i128) / 10_000i128;
         gross_amount - fee_amount
     }
 
@@ -928,15 +1301,11 @@ impl DividendDistributor {
             crate::security::DividendRights::Cumulative => {
                 base_amount.saturating_add(unpaid_accrued)
             }
-            crate::security::DividendRights::NonCumulative => {
-                base_amount
-            }
+            crate::security::DividendRights::NonCumulative => base_amount,
             crate::security::DividendRights::Participating => {
                 base_amount.saturating_add(excess_profit)
             }
-            crate::security::DividendRights::NonParticipating => {
-                base_amount
-            }
+            crate::security::DividendRights::NonParticipating => base_amount,
         }
     }
 
@@ -956,7 +1325,7 @@ impl DividendDistributor {
         let now = env.ledger().timestamp();
         let accrued_total = Self::settle_accrual(&env, &rate, now);
 
-        // Persist the settled rate so the next claim resumes from this timestamp
+        // Persist the settled rate so the next claim resumes from this timestamp.
         let mut updated_rate = rate.clone();
         updated_rate.total_accrued = accrued_total;
         updated_rate.last_accrual_update = now;
@@ -979,7 +1348,8 @@ impl DividendDistributor {
         };
         let last_claimed: i128 = env.storage().instance().get(&ack).unwrap_or(0i128);
 
-        let gross_amount = (balance * (accrued_total - last_claimed)) / 1000000000000000000i128;
+        let gross_amount =
+            (balance * (accrued_total - last_claimed)) / 1_000_000_000_000_000_000i128;
 
         if gross_amount <= 0 {
             panic_with_error!(&env, DividendError::NoDividendAvailable);
@@ -989,9 +1359,9 @@ impl DividendDistributor {
             .storage()
             .instance()
             .get(&Symbol::new(&env, "config"))
-            .unwrap_or_else(|| { panic_with_error!(&env, DividendError::ConfigNotFound); });
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::ConfigNotFound));
 
-        let fee_amount = (gross_amount * config.fee_rate as i128) / 10000i128;
+        let fee_amount = (gross_amount * config.fee_rate as i128) / 10_000i128;
         let net_amount = gross_amount - fee_amount;
 
         let currency_token_address =
@@ -1023,36 +1393,25 @@ impl DividendDistributor {
 
         Self::check_version(&env);
 
-        let distributions: Vec<DividendDistribution> = env
+        // Issue #130: update via map instead of rebuilding a Vec.
+        let mut distributions: Map<u64, DividendDistribution> = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, "distributions"))
-            .unwrap_or(Vec::new(&env));
+            .unwrap_or(Map::new(&env));
 
-        let mut found = false;
-        let mut new_distributions = Vec::<DividendDistribution>::new(&env);
-
-        for distribution in distributions.iter() {
-            if distribution.distribution_id == distribution_id {
-                let mut u = distribution.clone();
-                u.is_active = false;
-                new_distributions.push_back(u);
-                found = true;
-            } else {
-                new_distributions.push_back(distribution.clone());
-            }
-        }
-
-        if found {
+        if let Some(mut dist) = distributions.get(distribution_id) {
+            dist.is_active = false;
+            distributions.set(distribution_id, dist);
             env.storage()
                 .instance()
-                .set(&Symbol::new(&env, "distributions"), &new_distributions);
+                .set(&Symbol::new(&env, "distributions"), &distributions);
         }
     }
 
-    // ── Issue #139: emergency freeze & governance-gated unfreeze ──────────
+    // ── Issue #139: emergency freeze & governance-gated unfreeze ─────────────
 
-    /// Whether an emergency freeze is currently active. Defaults to `false`.
+    /// Whether an emergency freeze is currently active.  Defaults to `false`.
     pub fn is_distributions_frozen(env: Env) -> bool {
         Self::is_frozen(&env)
     }
@@ -1064,11 +1423,8 @@ impl DividendDistributor {
             .unwrap_or(false)
     }
 
-    /// Emergency halt. Stops both new distributions and all claims until a
-    /// governance proposal lifts the freeze. Admin-only.
-    ///
-    /// Existing distributions and already-accrued balances are left untouched
-    /// and become claimable again once the freeze is lifted.
+    /// Emergency halt.  Stops both new distributions and all claims until a
+    /// governance proposal lifts the freeze.  Admin-only.
     pub fn freeze_all_distributions(env: Env, auth: Address) {
         crate::shared_admin::require_admin(&env, &auth);
         Self::check_version(&env);
@@ -1084,10 +1440,6 @@ impl DividendDistributor {
     }
 
     /// Configure the governance committee that must approve an unfreeze.
-    ///
-    /// Mirrors the shared governance module: `owners` are the eligible
-    /// approvers, `threshold` the number of unique approvals required and
-    /// `timelock_seconds` the delay before a proposal becomes executable.
     pub fn init_distribution_governance(
         env: Env,
         auth: Address,
@@ -1095,9 +1447,6 @@ impl DividendDistributor {
         threshold: u32,
         timelock_seconds: u64,
     ) {
-        // Verify the caller is the contract admin *without* calling
-        // `require_auth` here: `write_governance` performs the single auth
-        // requirement for this frame.
         let admin: Address = env
             .storage()
             .instance()
@@ -1117,11 +1466,6 @@ impl DividendDistributor {
     }
 
     /// Create an emergency governance proposal authorising an unfreeze.
-    ///
-    /// Once it has been approved by the committee and passes its review
-    /// window, call `unfreeze_all_distributions` with the returned id and the
-    /// same `payload_hash`. Exposed as `create_unfreeze_proposal` because
-    /// Soroban caps exported function names at 32 characters.
     pub fn create_unfreeze_proposal(
         env: Env,
         proposer: Address,
@@ -1142,10 +1486,6 @@ impl DividendDistributor {
     }
 
     /// Lift an emergency freeze.
-    ///
-    /// This deliberately does **not** accept a plain admin call: the caller
-    /// must supply an approved and executable governance proposal. A direct
-    /// admin call (or one pointing at a non-approved proposal) is rejected.
     pub fn unfreeze_all_distributions(
         env: Env,
         executor: Address,
@@ -1157,16 +1497,10 @@ impl DividendDistributor {
         }
 
         let proposal_key = Symbol::new(&env, UNFREEZE_PROPOSAL_KEY);
-        if !crate::shared_governance::can_execute(
-            &env,
-            proposal_id,
-            proposal_key,
-            payload_hash,
-        ) {
+        if !crate::shared_governance::can_execute(&env, proposal_id, proposal_key, payload_hash) {
             panic_with_error!(&env, DividendError::InvalidGovernanceProposal);
         }
 
-        // Mark the proposal executed (also re-checks vetos / auth).
         crate::shared_governance::execute_mark(env.clone(), executor.clone(), proposal_id);
 
         env.storage()
@@ -1189,6 +1523,6 @@ impl DividendDistributor {
             .unwrap_or(Map::new(&env));
 
         map.get(currency)
-            .unwrap_or_else(|| { panic_with_error!(&env, DividendError::UnsupportedCurrency); })
+            .unwrap_or_else(|| panic_with_error!(&env, DividendError::UnsupportedCurrency))
     }
 }
