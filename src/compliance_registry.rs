@@ -20,6 +20,9 @@ pub enum ComplianceError {
     StorageOutdated = 10,
     RegistryNotInitialized = 11,
     AlreadyAtLatestVersion = 12,
+    DelegateNotFound = 13,
+    InvalidDateRange = 14,
+    ReportTooLarge = 15,
 }
 
 #[contracttype]
@@ -59,6 +62,50 @@ pub struct ComplianceRule {
     pub min_verification_level: u32,
     pub requires_accreditation: bool,
     pub max_amount: i128,
+}
+
+/// Issue #122: An external compliance check submitted by a delegated third-party
+/// integrator. These checks supplement — but do NOT replace — on-chain KYC and
+/// are never consulted by `check_compliance`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegatedCheck {
+    pub delegate: Address,
+    pub user: Address,
+    pub result: bool,
+    pub evidence_hash: Symbol,
+    pub timestamp: u64,
+}
+
+/// Issue #123: Per-asset-class risk score thresholds. When no entry exists for a
+/// given asset type the default (max_risk_score = 8, require_aml_clearance_above
+/// = 8) is used.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskThresholds {
+    pub max_risk_score: u32,
+    pub require_aml_clearance_above: u32,
+}
+
+/// Issue #124: A single entry in the compliance audit log used to build
+/// regulatory reports.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReportEntry {
+    pub timestamp: u64,
+    pub entry_type: Symbol,
+    pub address: Address,
+    pub details: Symbol,
+}
+
+/// Issue #124: A structured compliance report covering a bounded date range.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceReport {
+    pub report_type: Symbol,
+    pub start: u64,
+    pub end: u64,
+    pub entries: Vec<ReportEntry>,
 }
 
 // ... (around line 58)
@@ -104,6 +151,42 @@ impl ComplianceRegistry {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "initialized"), &true);
+
+        // Seed the three default SEC compliance rules (rule_144, reg_d, reg_s).
+        let mut rules = Vec::<ComplianceRule>::new(&env);
+        rules.push_back(ComplianceRule {
+            rule_id: Symbol::new(&env, "rule_144"),
+            name: Symbol::new(&env, "Rule144"),
+            description: Symbol::new(&env, "restricted_securities_resale"),
+            is_active: true,
+            jurisdictions: Vec::new(&env),
+            min_verification_level: 1,
+            requires_accreditation: false,
+            max_amount: 1_000_000,
+        });
+        rules.push_back(ComplianceRule {
+            rule_id: Symbol::new(&env, "reg_d"),
+            name: Symbol::new(&env, "RegD"),
+            description: Symbol::new(&env, "private_placement_exemption"),
+            is_active: true,
+            jurisdictions: Vec::new(&env),
+            min_verification_level: 2,
+            requires_accreditation: true,
+            max_amount: 5_000_000,
+        });
+        rules.push_back(ComplianceRule {
+            rule_id: Symbol::new(&env, "reg_s"),
+            name: Symbol::new(&env, "RegS"),
+            description: Symbol::new(&env, "non_us_offering"),
+            is_active: true,
+            jurisdictions: Vec::new(&env),
+            min_verification_level: 1,
+            requires_accreditation: false,
+            max_amount: 10_000_000,
+        });
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "compliance_rules"), &rules);
 
         env.events().publish(
             (Symbol::new(&env, "registry_initialized"), admin),
@@ -151,6 +234,16 @@ impl ComplianceRegistry {
         Self::check_version(&env);
 
         env.storage().instance().set(&user, &kyc_status);
+
+        // Issue #124: log the KYC verification for regulatory reporting.
+        if kyc_status.is_verified {
+            Self::log_compliance_event(
+                &env,
+                Symbol::new(&env, "kyc_verified"),
+                user.clone(),
+                Symbol::new(&env, "verified"),
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "kyc_updated"), user, auth),
@@ -203,6 +296,14 @@ impl ComplianceRegistry {
             .instance()
             .set(&Symbol::new(&env, "blacklist"), &blacklist);
 
+        // Issue #124: log the blacklist change for regulatory reporting.
+        Self::log_compliance_event(
+            &env,
+            Symbol::new(&env, "blacklisted"),
+            address.clone(),
+            reason.clone(),
+        );
+
         env.events()
             .publish((Symbol::new(&env, "blacklisted"), address, auth), reason);
     }
@@ -232,6 +333,15 @@ impl ComplianceRegistry {
             env.storage()
                 .instance()
                 .set(&Symbol::new(&env, "blacklist"), &new_blacklist);
+
+            // Issue #124: log the un-blacklist change for regulatory reporting.
+            Self::log_compliance_event(
+                &env,
+                Symbol::new(&env, "unblacklisted"),
+                address.clone(),
+                Symbol::new(&env, "removed"),
+            );
+
             env.events().publish(
                 (Symbol::new(&env, "unblacklisted"), address, auth),
                 Symbol::new(&env, "removed"),
@@ -297,14 +407,85 @@ impl ComplianceRegistry {
         let result = Self::check_compliance_internal(env.clone(), from.clone(), to.clone(), amount);
 
         env.events().publish(
-            (Symbol::new(&env, "compliance_check"), from, to),
+            (Symbol::new(&env, "compliance_check"), from.clone(), to.clone()),
             (amount, result),
+        );
+
+        // Issue #124: log the compliance check for regulatory reporting.
+        Self::log_compliance_event(
+            &env,
+            Symbol::new(&env, "compliance_check"),
+            from,
+            if result {
+                Symbol::new(&env, "passed")
+            } else {
+                Symbol::new(&env, "failed")
+            },
+        );
+
+        result
+    }
+
+    /// Issue #123: Asset-class-aware compliance check. Uses the risk thresholds
+    /// configured for `asset_type` (falling back to the default of 8) instead of
+    /// the hardcoded threshold used by `check_compliance`.
+    pub fn check_compliance_with_asset(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+        asset_type: Symbol,
+    ) -> bool {
+        let thresholds = Self::get_risk_thresholds(env.clone(), asset_type);
+        let result = Self::check_compliance_with_threshold(
+            env.clone(),
+            from.clone(),
+            to.clone(),
+            amount,
+            thresholds,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "compliance_check"), from.clone(), to.clone()),
+            (amount, result),
+        );
+
+        // Issue #124: log the compliance check for regulatory reporting.
+        Self::log_compliance_event(
+            &env,
+            Symbol::new(&env, "compliance_check"),
+            from,
+            if result {
+                Symbol::new(&env, "passed")
+            } else {
+                Symbol::new(&env, "failed")
+            },
         );
 
         result
     }
 
     fn check_compliance_internal(env: Env, from: Address, to: Address, amount: i128) -> bool {
+        // Default threshold of 8 — keeps existing `check_compliance` behaviour.
+        Self::check_compliance_with_threshold(
+            env,
+            from,
+            to,
+            amount,
+            RiskThresholds {
+                max_risk_score: 8,
+                require_aml_clearance_above: 8,
+            },
+        )
+    }
+
+    fn check_compliance_with_threshold(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+        thresholds: RiskThresholds,
+    ) -> bool {
         let kyc_required: bool = env
             .storage()
             .instance()
@@ -364,8 +545,11 @@ impl ComplianceRegistry {
                 return false;
             }
 
-            // 4. Risk score check — reject high-risk participants (score >= 8 out of 10)
-            if from_kyc.risk_score >= 8 || to_kyc.risk_score >= 8 {
+            // 4. Risk score check — reject high-risk participants using the
+            //    supplied (asset-specific or default) thresholds.
+            if from_kyc.risk_score >= thresholds.max_risk_score
+                || to_kyc.risk_score >= thresholds.max_risk_score
+            {
                 return false;
             }
         }
@@ -702,5 +886,284 @@ impl ComplianceRegistry {
             (Symbol::new(&env, "compliance_rule_updated"), auth),
             (rule.rule_id, rule.name, rule.is_active),
         );
+    }
+
+    // ── Issue #124: compliance event logging (private helper) ──────────────────
+
+    /// Append a single entry to the compliance audit log stored under
+    /// `compliance_log`. This log is later filtered by `generate_report` to
+    /// produce regulatory reports.
+    fn log_compliance_event(env: &Env, entry_type: Symbol, address: Address, details: Symbol) {
+        let mut log: Vec<ReportEntry> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(env, "compliance_log"))
+            .unwrap_or(Vec::new(env));
+
+        log.push_back(ReportEntry {
+            timestamp: env.ledger().timestamp(),
+            entry_type,
+            address,
+            details,
+        });
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, "compliance_log"), &log);
+    }
+
+    // ── Issue #122: delegated compliance verification ───────────────────────────
+
+    /// Register a third-party delegate authorised to submit external compliance
+    /// checks for `user`. Admin-only.
+    pub fn delegate_compliance_check(env: Env, auth: Address, delegate: Address, user: Address) {
+        crate::shared_admin::require_admin(&env, &auth);
+
+        Self::check_version(&env);
+
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "delegates"))
+            .unwrap_or(Vec::new(&env));
+
+        // Avoid duplicate registrations.
+        let already = delegates.iter().any(|a| a.clone() == delegate);
+        if !already {
+            delegates.push_back(delegate.clone());
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "delegates"), &delegates);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "delegate_registered"), delegate, user),
+            auth,
+        );
+    }
+
+    /// Remove a previously-registered delegate. Admin-only.
+    pub fn remove_delegate(env: Env, auth: Address, delegate: Address) {
+        crate::shared_admin::require_admin(&env, &auth);
+
+        Self::check_version(&env);
+
+        let delegates: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "delegates"))
+            .unwrap_or(Vec::new(&env));
+
+        let mut new_delegates = Vec::<Address>::new(&env);
+        let mut found = false;
+        for addr in delegates.iter() {
+            if addr.clone() == delegate {
+                found = true;
+            } else {
+                new_delegates.push_back(addr.clone());
+            }
+        }
+
+        if !found {
+            panic_with_error!(&env, ComplianceError::DelegateNotFound);
+        }
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "delegates"), &new_delegates);
+
+        env.events()
+            .publish((Symbol::new(&env, "delegate_removed"), delegate), auth);
+    }
+
+    /// List all currently-registered delegates.
+    pub fn list_delegates(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "delegates"))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Submit an external compliance check. The caller must be a registered
+    /// delegate. External checks are stored separately from on-chain KYC and
+    /// are NOT consulted by `check_compliance`.
+    pub fn submit_external_check(
+        env: Env,
+        delegate: Address,
+        user: Address,
+        result: bool,
+        evidence_hash: Symbol,
+    ) {
+        delegate.require_auth();
+
+        Self::check_version(&env);
+
+        let delegates: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "delegates"))
+            .unwrap_or(Vec::new(&env));
+
+        let is_delegate = delegates.iter().any(|a| a.clone() == delegate);
+        if !is_delegate {
+            panic_with_error!(&env, ComplianceError::DelegateNotFound);
+        }
+
+        let timestamp = env.ledger().timestamp();
+
+        let mut checks: Vec<DelegatedCheck> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "external_checks"))
+            .unwrap_or(Vec::new(&env));
+
+        checks.push_back(DelegatedCheck {
+            delegate: delegate.clone(),
+            user: user.clone(),
+            result,
+            evidence_hash: evidence_hash.clone(),
+            timestamp,
+        });
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "external_checks"), &checks);
+
+        env.events().publish(
+            (Symbol::new(&env, "external_check_submitted"), delegate, user),
+            (result, evidence_hash, timestamp),
+        );
+    }
+
+    /// Return all external checks submitted for `user`.
+    pub fn get_external_checks(env: Env, user: Address) -> Vec<DelegatedCheck> {
+        let checks: Vec<DelegatedCheck> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "external_checks"))
+            .unwrap_or(Vec::new(&env));
+
+        let mut result = Vec::<DelegatedCheck>::new(&env);
+        for check in checks.iter() {
+            if check.user == user {
+                result.push_back(check.clone());
+            }
+        }
+        result
+    }
+
+    // ── Issue #123: configurable risk score thresholds ────────────────────────
+
+    /// Set risk score thresholds for a specific asset type. Admin-only.
+    pub fn set_risk_thresholds(env: Env, auth: Address, asset_type: Symbol, thresholds: RiskThresholds) {
+        crate::shared_admin::require_admin(&env, &auth);
+
+        Self::check_version(&env);
+
+        let map_key = Symbol::new(&env, "risk_thresholds");
+        let mut map: Map<Symbol, RiskThresholds> = env
+            .storage()
+            .instance()
+            .get(&map_key)
+            .unwrap_or(Map::new(&env));
+
+        map.set(asset_type.clone(), thresholds.clone());
+        env.storage().instance().set(&map_key, &map);
+
+        env.events().publish(
+            (Symbol::new(&env, "risk_thresholds_set"), asset_type),
+            (thresholds.max_risk_score, thresholds.require_aml_clearance_above),
+        );
+    }
+
+    /// Get risk thresholds for `asset_type`. Returns the default
+    /// (max_risk_score = 8, require_aml_clearance_above = 8) when no thresholds
+    /// have been configured for the asset type.
+    pub fn get_risk_thresholds(env: Env, asset_type: Symbol) -> RiskThresholds {
+        let map_key = Symbol::new(&env, "risk_thresholds");
+        let map: Map<Symbol, RiskThresholds> = env
+            .storage()
+            .instance()
+            .get(&map_key)
+            .unwrap_or(Map::new(&env));
+
+        map.get(asset_type).unwrap_or(RiskThresholds {
+            max_risk_score: 8,
+            require_aml_clearance_above: 8,
+        })
+    }
+
+    // ── Issue #124: compliance data export for regulatory reporting ───────────
+
+    /// Generate a structured compliance report for the given report type and
+    /// date range. Read-only — callable by anyone.
+    ///
+    /// `report_type` should be one of:
+    /// - `KYC_VERIFICATIONS`  — entries logged as `kyc_verified`
+    /// - `TRANSFER_ACTIVITY`   — entries logged as `compliance_check`
+    /// - `BLACKLIST_CHANGES`   — entries logged as `blacklisted` / `unblacklisted`
+    /// - `SUSPICIOUS_ACTIVITY` — entries logged as `suspicious`
+    ///
+    /// The date window (`end - start`) must not exceed 90 days (in seconds).
+    pub fn generate_report(env: Env, report_type: Symbol, start: u64, end: u64) -> ComplianceReport {
+        // Validate the date range.
+        if end <= start {
+            panic_with_error!(&env, ComplianceError::InvalidDateRange);
+        }
+        let max_window: u64 = 90 * 86400;
+        if end - start > max_window {
+            panic_with_error!(&env, ComplianceError::ReportTooLarge);
+        }
+
+        let log: Vec<ReportEntry> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "compliance_log"))
+            .unwrap_or(Vec::new(&env));
+
+        let mut entries = Vec::<ReportEntry>::new(&env);
+
+        // Determine which entry types belong to the requested report type.
+        let kyc_verified = Symbol::new(&env, "kyc_verified");
+        let compliance_check = Symbol::new(&env, "compliance_check");
+        let blacklisted = Symbol::new(&env, "blacklisted");
+        let unblacklisted = Symbol::new(&env, "unblacklisted");
+        let suspicious = Symbol::new(&env, "suspicious");
+
+        let report_kyc = Symbol::new(&env, "KYC_VERIFICATIONS");
+        let report_transfer = Symbol::new(&env, "TRANSFER_ACTIVITY");
+        let report_blacklist = Symbol::new(&env, "BLACKLIST_CHANGES");
+        let report_suspicious = Symbol::new(&env, "SUSPICIOUS_ACTIVITY");
+
+        for entry in log.iter() {
+            // Date-range filter (inclusive of [start, end]).
+            if entry.timestamp < start || entry.timestamp > end {
+                continue;
+            }
+
+            let matches = if report_type == report_kyc {
+                entry.entry_type == kyc_verified
+            } else if report_type == report_transfer {
+                entry.entry_type == compliance_check
+            } else if report_type == report_blacklist {
+                entry.entry_type == blacklisted || entry.entry_type == unblacklisted
+            } else if report_type == report_suspicious {
+                entry.entry_type == suspicious
+            } else {
+                // Unknown report type — no matches.
+                false
+            };
+
+            if matches {
+                entries.push_back(entry.clone());
+            }
+        }
+
+        ComplianceReport {
+            report_type,
+            start,
+            end,
+            entries,
+        }
     }
 }
