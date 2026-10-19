@@ -1061,3 +1061,119 @@ fn initialize_with_metadata_succeeds() {
     let info = token.get_token_info();
     assert_eq!(info.metadata.len(), 2);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issue #104: initialization state
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn initialize_cannot_be_called_twice() {
+    // Before the fix the initialization flag was checked but never written, so
+    // a second initialize went through: it overwrote `token_info`, replaced
+    // the admin and minted the initial supply a second time.
+    let t = setup();
+    let supply_before = t.token.get_balance(&t.admin).amount;
+
+    let result = t.token.try_initialize(
+        &t.admin,
+        &Symbol::new(&t.env, "Second"),
+        &Symbol::new(&t.env, "SEC"),
+        &500i128,
+        &6u32,
+        &Symbol::new(&t.env, "real_estate"),
+        &Map::new(&t.env),
+        &t.admin,
+        &t.admin,
+    );
+
+    assert!(result.is_err());
+    assert_eq!(t.token.get_balance(&t.admin).amount, supply_before);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issue #103: batch transfer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn batch_transfer_pays_every_recipient() {
+    let t = setup();
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+
+    let mut recipients = Vec::new(&t.env);
+    recipients.push_back(alice.clone());
+    recipients.push_back(bob.clone());
+
+    let mut amounts = Vec::new(&t.env);
+    amounts.push_back(100i128);
+    amounts.push_back(250i128);
+
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
+
+    assert_eq!(t.token.get_balance(&alice).amount, 100);
+    assert_eq!(t.token.get_balance(&bob).amount, 250);
+    assert_eq!(t.token.get_balance(&t.admin).amount, 1_000_000 - 350);
+}
+
+#[test]
+#[should_panic]
+fn batch_transfer_rejects_mismatched_array_lengths() {
+    let t = setup();
+    let alice = Address::generate(&t.env);
+
+    let mut recipients = Vec::new(&t.env);
+    recipients.push_back(alice.clone());
+
+    let mut amounts = Vec::new(&t.env);
+    amounts.push_back(100i128);
+    amounts.push_back(250i128);
+
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
+}
+
+#[test]
+#[should_panic]
+fn batch_transfer_rejects_an_empty_batch() {
+    let t = setup();
+
+    let recipients = Vec::new(&t.env);
+    let amounts = Vec::new(&t.env);
+
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
+}
+
+#[test]
+#[should_panic]
+fn batch_transfer_rejects_more_than_25_recipients() {
+    let t = setup();
+
+    let mut recipients = Vec::new(&t.env);
+    let mut amounts = Vec::new(&t.env);
+    for _ in 0..26 {
+        recipients.push_back(Address::generate(&t.env));
+        amounts.push_back(1i128);
+    }
+
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
+}
+
+#[test]
+#[should_panic]
+fn batch_transfer_reverts_when_a_recipient_fails_compliance() {
+    let t = setup();
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+
+    t.compliance
+        .add_to_blacklist(&t.admin, &alice, &Symbol::new(&t.env, "sanctioned"));
+
+    let mut recipients = Vec::new(&t.env);
+    recipients.push_back(alice.clone());
+    recipients.push_back(bob.clone());
+
+    let mut amounts = Vec::new(&t.env);
+    amounts.push_back(100i128);
+    amounts.push_back(250i128);
+
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
+}

@@ -6,6 +6,9 @@ use crate::compliance_registry::ComplianceRegistryClient;
 
 const STORAGE_VERSION: u32 = 1;
 
+/// Maximum number of recipients a single `batch_transfer` may pay out to.
+const MAX_BATCH_SIZE: u32 = 25;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum RWATokenError {
@@ -26,6 +29,7 @@ pub enum RWATokenError {
     TokenNotInitialized = 15,
     AlreadyAtLatestVersion = 16,
     TokenPaused = 17,
+    InvalidBatch = 18,
 }
 
 #[contracttype]
@@ -125,6 +129,16 @@ impl RWAToken {
             .set(&Symbol::new(&env, "locks"),
             &Map::<Address, LockSlot>::new(&env),
         );
+
+        // Issue #104 — the initialization flag is the single source of truth
+        // for "this token has been initialized". It was checked at the top of
+        // this function but never written, so `initialize` could be called
+        // again on a live token: the second call overwrote `token_info`,
+        // replaced the admin and minted the initial supply a second time.
+        // The compliance registry already stores the flag this way.
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "initialized"), &true);
 
         // The initializing `auth` becomes this token's admin: `mint` (which
         // performs the single auth check for this frame) requires it.
@@ -578,5 +592,92 @@ impl RWAToken {
 
         let registry = ComplianceRegistryClient::new(&env, &token_info.compliance_registry);
         registry.check_outbound_participant(&from, &amount)
+    }
+
+    /// Transfers to several recipients in a single call.
+    ///
+    /// `recipients` and `amounts` must have the same length and the batch is
+    /// capped at `MAX_BATCH_SIZE` recipients. Every recipient is compliance
+    /// checked *before* any balance moves, so a single non-compliant recipient
+    /// reverts the whole batch instead of leaving a partial distribution
+    /// behind. One `batch_transfer` event is emitted for the whole batch.
+    pub fn batch_transfer(
+        env: Env,
+        from: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+    ) {
+        if recipients.len() != amounts.len() || recipients.is_empty() {
+            panic_with_error!(&env, RWATokenError::InvalidBatch);
+        }
+        if recipients.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, RWATokenError::InvalidBatch);
+        }
+
+        // Require explicit authorisation from the sender
+        from.require_auth();
+
+        Self::check_version(&env);
+
+        let token_info: TokenInfo = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "token_info"))
+            .unwrap_or_else(|| { panic_with_error!(&env, RWATokenError::TokenInfoNotFound); });
+
+        if token_info.is_paused || token_info.is_frozen {
+            panic_with_error!(&env, RWATokenError::TransferPaused);
+        }
+
+        // ── Validate every recipient before moving anything ───────────────────
+        let mut total: i128 = 0;
+        for i in 0..recipients.len() {
+            let to = recipients.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+
+            if amount <= 0 {
+                panic_with_error!(&env, RWATokenError::InvalidAmount);
+            }
+
+            if !Self::check_transfer_compliance(env.clone(), from.clone(), to.clone(), amount) {
+                panic_with_error!(&env, RWATokenError::ComplianceCheckFailed);
+            }
+
+            total = total
+                .checked_add(amount)
+                .unwrap_or_else(|| panic_with_error!(&env, RWATokenError::Overflow));
+        }
+
+        // ── Move the funds ───────────────────────────────────────────────────
+        let mut from_balance = Self::get_balance(env.clone(), from.clone());
+
+        // Only spendable (unlocked) tokens may be transferred
+        let spendable = from_balance.amount
+            .checked_sub(from_balance.locked_amount)
+            .unwrap_or(0);
+        if spendable < total {
+            panic_with_error!(&env, RWATokenError::InsufficientBalance);
+        }
+
+        from_balance.amount = from_balance.amount
+            .checked_sub(total)
+            .unwrap_or_else(|| panic_with_error!(&env, RWATokenError::Underflow));
+        env.storage().instance().set(&from, &from_balance);
+
+        for i in 0..recipients.len() {
+            let to = recipients.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+
+            let mut to_balance = Self::get_balance(env.clone(), to.clone());
+            to_balance.amount = to_balance.amount
+                .checked_add(amount)
+                .unwrap_or_else(|| panic_with_error!(&env, RWATokenError::Overflow));
+            env.storage().instance().set(&to, &to_balance);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_transfer"), from.clone()),
+            (recipients.len(), total, env.ledger().timestamp()),
+        );
     }
 }
