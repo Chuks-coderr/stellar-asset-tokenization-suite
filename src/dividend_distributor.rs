@@ -47,7 +47,7 @@ pub enum DividendError {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DividendDistribution {
     pub distribution_id: u64,
     pub token_address: Address,
@@ -93,6 +93,16 @@ pub struct AccrualRate {
 pub struct AccrualClaimKey {
     pub token_address: Address,
     pub claimer: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DistributionHistoryPage {
+    pub distributions: Vec<DividendDistribution>,
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u64,
+    pub has_more: bool,
 }
 
 #[contracttype]
@@ -715,6 +725,51 @@ impl DividendDistributor {
         }
 
         active_distributions
+    }
+
+    /// Returns a paginated page of all distributions (active and inactive),
+    /// ordered by creation time descending (newest first). `offset` skips the
+    /// first `offset` entries; `limit` caps the page size.
+    pub fn get_distribution_history(
+        env: Env,
+        offset: u64,
+        limit: u64,
+    ) -> DistributionHistoryPage {
+        let distributions: Vec<DividendDistribution> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "distributions"))
+            .unwrap_or(Vec::new(&env));
+
+        let total = distributions.len() as u64;
+
+        // Clamp offset to total.
+        let start = if offset >= total { total } else { offset };
+        // Cap limit to a sane maximum to prevent runaway reads.
+        let max_limit: u64 = 100;
+        let page_limit = if limit == 0 || limit > max_limit { max_limit } else { limit };
+
+        let mut page = Vec::<DividendDistribution>::new(&env);
+        let mut end = start.saturating_add(page_limit);
+        if end > total {
+            end = total;
+        }
+
+        // Iterate in reverse so newest distributions appear first.
+        let mut i = end;
+        while i > start {
+            i -= 1;
+            let dist = distributions.get(i as u32).unwrap();
+            page.push_back(dist);
+        }
+
+        DistributionHistoryPage {
+            distributions: page,
+            total,
+            offset: start,
+            limit: page_limit,
+            has_more: end < total,
+        }
     }
 
     pub fn get_claim_info(env: Env, distribution_id: u64, claimer: Address) -> Option<ClaimInfo> {
