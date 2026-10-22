@@ -9,8 +9,8 @@ use soroban_sdk::{
 use crate::{
     compliance_registry::{ComplianceRegistry, ComplianceRegistryClient},
     dividend_distributor::{
-        DividendConfig, DividendDistributor, DividendDistributorClient, DividendError,
-        DEFAULT_MIN_CLAIM_WINDOW,
+        ClaimState, DistributionCategory, DividendConfig, DividendDistributor, DividendDistributorClient,
+        DividendError, MAX_FEE_RATE, RecurringSchedule, DEFAULT_MIN_CLAIM_WINDOW,
     },
     rwa_token::{RWAToken, RWATokenClient},
 };
@@ -125,6 +125,7 @@ fn create_distribution_returns_id_one() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -140,6 +141,7 @@ fn create_distribution_increments_id() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     let id2 = t.distributor.create_distribution(
@@ -148,6 +150,7 @@ fn create_distribution_increments_id() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id2, id1 + 1);
@@ -164,6 +167,7 @@ fn create_distribution_with_zero_amount_panics() {
         &t.currency_symbol,
         &0i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 }
@@ -179,6 +183,7 @@ fn create_distribution_with_unsupported_currency_panics() {
         &Symbol::new(&t.env, "UNKNOWN"),
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 }
@@ -195,6 +200,7 @@ fn create_distribution_by_non_admin_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 }
@@ -217,6 +223,7 @@ fn create_distribution_with_too_soon_deadline_returns_claim_deadline_too_soon() 
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     match res {
@@ -240,6 +247,7 @@ fn create_distribution_with_too_soon_deadline_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 }
@@ -255,6 +263,7 @@ fn create_distribution_with_deadline_at_minimum_window_succeeds() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -272,6 +281,7 @@ fn create_distribution_with_normal_deadline_succeeds() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -305,6 +315,7 @@ fn min_claim_window_is_configurable_via_update_config() {
         &t.currency_symbol,
         &1000i128,
         &short_deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     match res {
@@ -324,6 +335,7 @@ fn min_claim_window_is_configurable_via_update_config() {
         &t.currency_symbol,
         &1000i128,
         &ok_deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -341,6 +353,7 @@ fn get_distribution_returns_correct_data() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     let dist = t.distributor.get_distribution(&id);
@@ -373,6 +386,7 @@ fn claim_dividend_transfers_net_amount_to_claimer() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -396,6 +410,7 @@ fn claim_dividend_twice_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -419,6 +434,7 @@ fn claim_dividend_after_deadline_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -440,6 +456,7 @@ fn claim_dividend_with_zero_balance_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -461,6 +478,7 @@ fn calculate_available_dividend_returns_proportional_amount() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -482,6 +500,7 @@ fn calculate_available_dividend_returns_zero_after_claim() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -506,6 +525,7 @@ fn claim_on_deactivated_distribution_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -540,6 +560,7 @@ fn update_config_changes_fee_rate() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     let claimed = t.distributor.claim_dividend(&id, &claimer);
@@ -565,6 +586,7 @@ fn migrate_preserves_config_and_currencies() {
         &t.currency_symbol,
         &500i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -592,6 +614,7 @@ fn migrate_preserves_claim_state() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -668,6 +691,7 @@ fn migrate_with_empty_distributions() {
         &t.currency_symbol,
         &500i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -699,6 +723,7 @@ fn migrate_preserves_auto_distribution_config() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     let dist = t.distributor.get_distribution(&id);
@@ -866,6 +891,7 @@ fn create_distribution(t: &TestEnv, token_address: &Address) -> u64 {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     )
 }

@@ -12,6 +12,10 @@ const STORAGE_VERSION: u32 = 1;
 /// Configurable per-deployment via `DividendConfig.min_claim_window`.
 pub const DEFAULT_MIN_CLAIM_WINDOW: u64 = 3600;
 
+/// Maximum allowed fee rate in basis points (1000 bps = 10%).
+/// Enforced by `update_config` (issue #136).
+pub const MAX_FEE_RATE: i64 = 1000;
+
 /// Proposal key used by the governance committee to authorise lifting an
 /// emergency freeze (`freeze_all_distributions`). See issue #139.
 pub const UNFREEZE_PROPOSAL_KEY: &str = "unfreeze_distributions";
@@ -44,6 +48,9 @@ pub enum DividendError {
     // Issue #139: emergency freeze errors.
     DistributionsFrozen = 23,
     InvalidGovernanceProposal = 24,
+    // Issue #136: fee rate cap errors.
+    FeeRateTooHigh = 25,
+    FeeRateNegative = 26,
 }
 
 #[contracttype]
@@ -59,6 +66,17 @@ pub struct DividendDistribution {
     pub created_at: u64,
     pub is_active: bool,
     pub metadata: Map<Symbol, Symbol>,
+    /// Issue #133: distribution category for grouping/filtering.
+    pub category: DistributionCategory,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DistributionCategory {
+    Regular,
+    Special,
+    Bonus,
+    Governance,
 }
 
 #[contracttype]
@@ -79,6 +97,14 @@ pub struct ClaimInfo {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClaimState {
+    Unclaimed,
+    InProgress,
+    Claimed,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub struct AccrualRate {
     pub token_address: Address,
@@ -93,6 +119,25 @@ pub struct AccrualRate {
 pub struct AccrualClaimKey {
     pub token_address: Address,
     pub claimer: Address,
+}
+
+/// Issue #131: cron-like recurring distribution schedule.
+///
+/// `minute`, `hour`, `day_of_month`, `month`, and `day_of_week` use `-1` as a
+/// wildcard meaning "every". A schedule is due when all fields match the
+/// current ledger timestamp.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecurringSchedule {
+    pub minute: i64,
+    pub hour: i64,
+    pub day_of_month: i64,
+    pub month: i64,
+    pub day_of_week: i64,
+    /// Last timestamp this schedule fired (0 means never).
+    pub last_fired_at: u64,
+    /// Interval in seconds between allowed firings (min spacing guard).
+    pub min_interval_seconds: u64,
 }
 
 #[contracttype]
@@ -191,6 +236,20 @@ impl DividendDistributor {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "version"), &STORAGE_VERSION);
+        // Issue #134: claim state machine storage.
+        env.storage()
+            .instance()
+            .set(
+                &Symbol::new(&env, "claim_states"),
+                &Map::<ClaimKey, ClaimState>::new(&env),
+            );
+        // Issue #131: recurring schedule storage.
+        env.storage()
+            .instance()
+            .set(
+                &Symbol::new(&env, "recurring_schedules"),
+                &Map::<u64, RecurringSchedule>::new(&env),
+            );
     }
 
     fn read_version(env: &Env) -> u32 {
@@ -285,6 +344,7 @@ impl DividendDistributor {
                 amount,
                 claim_deadline,
                 metadata.clone(),
+                DistributionCategory::Regular,
             );
             ids.push_back(distribution_id);
             i += 1;
@@ -351,6 +411,7 @@ impl DividendDistributor {
         amount: i128,
         claim_deadline: u64,
         metadata: Map<Symbol, Symbol>,
+        category: DistributionCategory,
     ) -> u64 {
         if amount <= 0 {
             panic_with_error!(&env, DividendError::InvalidAmount);
@@ -424,6 +485,7 @@ impl DividendDistributor {
             created_at: env.ledger().timestamp(),
             is_active: true,
             metadata,
+            category,
         };
 
         let mut distributions: Vec<DividendDistribution> = env
@@ -493,8 +555,16 @@ impl DividendDistributor {
             distribution_id,
             claimer: claimer.clone(),
         };
-        if env.storage().instance().has(&ck) {
-            panic_with_error!(&env, DividendError::AlreadyClaimed);
+        // Issue #134: claim state machine — reject already-claimed or in-progress claims.
+        let claim_state: ClaimState = env
+            .storage()
+            .instance()
+            .get(&ck)
+            .unwrap_or(ClaimState::Unclaimed);
+        match claim_state {
+            ClaimState::Claimed => panic_with_error!(&env, DividendError::AlreadyClaimed),
+            ClaimState::InProgress => panic_with_error!(&env, DividendError::InvalidParameters),
+            ClaimState::Unclaimed => {}
         }
 
         let rwa_client = RWATokenClient::new(&env, &distribution.token_address);
@@ -524,6 +594,11 @@ impl DividendDistributor {
             Self::get_currency_token_address(env.clone(), dist_currency.clone());
         let currency_client = TokenClient::new(&env, &currency_token_address);
 
+        // Issue #134: lock claim as InProgress before transferring funds.
+        env.storage()
+            .instance()
+            .set(&ck, &ClaimState::InProgress);
+
         currency_client.transfer(&env.current_contract_address(), &claimer, &net_amount);
 
         if fee_amount > 0 {
@@ -543,6 +618,9 @@ impl DividendDistributor {
         };
 
         env.storage().instance().set(&ck, &claim_info);
+
+        // Issue #134: mark claim as Claimed after successful transfer.
+        env.storage().instance().set(&ck, &ClaimState::Claimed);
 
         let tot_key = Symbol::new(&env, "clm_tot");
         let mut totals: Map<u64, i128> = env
@@ -952,6 +1030,15 @@ impl DividendDistributor {
     pub fn update_config(env: Env, auth: Address, new_config: DividendConfig) {
         crate::shared_admin::require_admin(&env, &auth);
         Self::check_version(&env);
+
+        // Issue #136: enforce fee rate cap (max 1000 bps = 10%).
+        if new_config.fee_rate < 0 {
+            panic_with_error!(&env, DividendError::FeeRateNegative);
+        }
+        if new_config.fee_rate > MAX_FEE_RATE {
+            panic_with_error!(&env, DividendError::FeeRateTooHigh);
+        }
+
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "config"), &new_config);
@@ -1234,6 +1321,127 @@ impl DividendDistributor {
         );
 
         true
+    }
+
+    /// Issue #133: returns all distributions matching the given category.
+    pub fn get_distributions_by_category(env: Env, category: DistributionCategory) -> Vec<DividendDistribution> {
+        let distributions: Vec<DividendDistribution> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "distributions"))
+            .unwrap_or(Vec::new(&env));
+
+        let mut result = Vec::<DividendDistribution>::new(&env);
+        for d in distributions.iter() {
+            if d.category == category {
+                result.push_back(d.clone());
+            }
+        }
+        result
+    }
+
+    /// Issue #134: returns the current claim state for a (distribution, claimer) pair.
+    pub fn get_claim_state(env: Env, distribution_id: u64, claimer: Address) -> ClaimState {
+        let ck = ClaimKey {
+            distribution_id,
+            claimer,
+        };
+        env.storage()
+            .instance()
+            .get(&ck)
+            .unwrap_or(ClaimState::Unclaimed)
+    }
+
+    /// Issue #131: creates a distribution bound to a recurring cron-like schedule.
+    /// The schedule is stored and can be queried with `get_recurring_schedule`.
+    pub fn create_recurring_distribution(
+        env: Env,
+        auth: Address,
+        token_address: Address,
+        currency: Symbol,
+        amount: i128,
+        claim_deadline: u64,
+        metadata: Map<Symbol, Symbol>,
+        category: DistributionCategory,
+        schedule: RecurringSchedule,
+    ) -> u64 {
+        let currency_for_event = currency.clone();
+        let distribution_id = Self::create_distribution(
+            env.clone(),
+            auth.clone(),
+            token_address.clone(),
+            currency,
+            amount,
+            claim_deadline,
+            metadata,
+            category,
+        );
+
+        env.storage()
+            .instance()
+            .set(
+                &Symbol::new(&env, "recurring_schedules"),
+                &{
+                    let mut schedules: Map<u64, RecurringSchedule> = env
+                        .storage()
+                        .instance()
+                        .get(&Symbol::new(&env, "recurring_schedules"))
+                        .unwrap_or(Map::new(&env));
+                    schedules.set(distribution_id, schedule);
+                    schedules
+                },
+            );
+
+        env.events().publish(
+            (Symbol::new(&env, "recurring_distribution_created"), token_address),
+            (distribution_id, amount, currency_for_event, env.ledger().timestamp()),
+        );
+
+        distribution_id
+    }
+
+    /// Issue #131: returns the recurring schedule for a distribution, if any.
+    pub fn get_recurring_schedule(env: Env, distribution_id: u64) -> Option<RecurringSchedule> {
+        let schedules: Map<u64, RecurringSchedule> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "recurring_schedules"))
+            .unwrap_or(Map::new(&env));
+        schedules.get(distribution_id)
+    }
+
+    /// Issue #131: checks whether a recurring schedule is due to fire now.
+    /// A schedule matches when all non-wildcard (-1) fields equal the current
+    /// ledger time components, and the min interval has elapsed since last fire.
+    pub fn is_schedule_due(env: Env, distribution_id: u64) -> bool {
+        let schedule = match Self::get_recurring_schedule(env.clone(), distribution_id) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let now = env.ledger().timestamp();
+        if now - schedule.last_fired_at < schedule.min_interval_seconds {
+            return false;
+        }
+
+        // Compute time components from the ledger timestamp.
+        // Soroban ledger timestamps are Unix seconds; derive UTC components.
+        let secs = now as i64;
+        let minute = (secs % 3600 / 60) as i64;
+        let hour = (secs % 86400 / 3600) as i64;
+        // Approximate day_of_month/month/day_of_week from epoch days.
+        let days_since_epoch = (secs / 86400) as i64;
+        let day_of_month = ((days_since_epoch % 30) + 1) as i64;
+        let month = ((days_since_epoch / 30 % 12) + 1) as i64;
+        let day_of_week = (days_since_epoch % 7) as i64;
+
+        let matches = (schedule.minute == -1 || schedule.minute == minute)
+            && (schedule.hour == -1 || schedule.hour == hour)
+            && (schedule.day_of_month == -1 || schedule.day_of_month == day_of_month)
+            && (schedule.month == -1 || schedule.month == month)
+            && (schedule.day_of_week == -1 || schedule.day_of_week == day_of_week);
+
+        matches
     }
 
     fn get_currency_token_address(env: Env, currency: Symbol) -> Address {

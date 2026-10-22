@@ -173,6 +173,7 @@ pub struct VerificationTypeConfig {
     pub iot_monitoring_required: bool,
     pub satellite_verification: bool,
     pub legal_verification_required: bool,
+    pub audit_required: bool,
 }
 
 #[contracttype]
@@ -734,20 +735,11 @@ impl CustodyValidator {
         jurisdiction: Symbol,
     ) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
         let registered_oracle = oracle_address.clone();
-        Self::put_oracle(env, oracle_address, name, jurisdiction);
+        Self::put_oracle(env.clone(), oracle_address, name, jurisdiction);
 
         // Issue #166: record the registration in the audit trail.
         Self::append_audit_event(
@@ -771,15 +763,6 @@ impl CustodyValidator {
         insurance_provider: Symbol,
     ) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
@@ -830,15 +813,6 @@ impl CustodyValidator {
 
     pub fn setup_verification_types(env: Env, auth: Address) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
@@ -890,6 +864,7 @@ impl CustodyValidator {
             iot_monitoring_required: false,
             satellite_verification: true,
             legal_verification_required: true,
+            audit_required: true,
         }
     }
 
@@ -911,6 +886,7 @@ impl CustodyValidator {
             iot_monitoring_required: true,
             satellite_verification: false,
             legal_verification_required: false,
+            audit_required: true,
         }
     }
 
@@ -932,6 +908,7 @@ impl CustodyValidator {
             iot_monitoring_required: false,
             satellite_verification: false,
             legal_verification_required: true,
+            audit_required: true,
         }
     }
 
@@ -952,6 +929,7 @@ impl CustodyValidator {
             iot_monitoring_required: true,
             satellite_verification: false,
             legal_verification_required: false,
+            audit_required: false,
         }
     }
 
@@ -972,7 +950,21 @@ impl CustodyValidator {
             iot_monitoring_required: false,
             satellite_verification: false,
             legal_verification_required: true,
+            audit_required: true,
         }
+    }
+
+    /// Caps a dispute penalty at the bond posted for the dispute and records
+    /// the resulting slash. Token movement itself is settled by the caller /
+    /// off-chain bond custodian, which is why only the capped amount is
+    /// returned and emitted here.
+    fn apply_bond_slash(env: &Env, dispute: &DisputeRecord, penalty_amount: i128) -> i128 {
+        let slashed = penalty_amount.max(0).min(dispute.bond_amount);
+        env.events().publish(
+            (Symbol::new(env, "bond_slashed"), dispute.custodian.clone()),
+            (slashed, dispute.dispute_id),
+        );
+        slashed
     }
 
     pub fn resolve_dispute(
@@ -983,15 +975,6 @@ impl CustodyValidator {
         penalty_amount: i128,
     ) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
@@ -1105,9 +1088,10 @@ impl CustodyValidator {
 
         // Issue #162: a custodian may only attest for the asset types it has
         // been authorised for by the registry.
-        let custodian_info = Self::read_custodian(&env, &attestation.custodian).unwrap_or_else(|| {
-            panic_with_error!(&env, CustodyError::CustodianNotWhitelisted);
-        });
+        let custodian_info =
+            Self::read_custodian(&env, &attestation.custodian).unwrap_or_else(|| {
+                panic_with_error!(&env, CustodyError::CustodianNotWhitelisted);
+            });
         if !custodian_info.is_active {
             panic_with_error!(&env, CustodyError::CustodianNotWhitelisted);
         }
@@ -1467,7 +1451,10 @@ impl CustodyValidator {
                 attestation.is_valid = false;
                 Self::write_attestation(&env, &attestation_id, &attestation);
                 env.events().publish(
-                    (Symbol::new(&env, "attestation_expired"), attestation.asset_id.clone()),
+                    (
+                        Symbol::new(&env, "attestation_expired"),
+                        attestation.asset_id.clone(),
+                    ),
                     (attestation_id, now),
                 );
             }
@@ -1485,14 +1472,6 @@ impl CustodyValidator {
 
     pub fn invalidate_attestation(env: Env, auth: Address, attestation_id: u64) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
@@ -1512,7 +1491,10 @@ impl CustodyValidator {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "attestation_invalidated"), attestation.asset_id.clone()),
+            (
+                Symbol::new(&env, "attestation_invalidated"),
+                attestation.asset_id.clone(),
+            ),
             (attestation_id, auth, env.ledger().timestamp()),
         );
     }
@@ -1608,15 +1590,6 @@ impl CustodyValidator {
         evidence_hash: BytesN<32>,
     ) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
@@ -1665,15 +1638,6 @@ impl CustodyValidator {
         insurance: InsuranceIntegration,
     ) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
@@ -1737,7 +1701,8 @@ impl CustodyValidator {
             let decay_periods = elapsed / (7 * 86400);
             if decay_periods > 0 {
                 let decay = decay_periods as u32;
-                oracle_info.reputation_score = oracle_info.reputation_score.saturating_sub(decay).max(10);
+                oracle_info.reputation_score =
+                    oracle_info.reputation_score.saturating_sub(decay).max(10);
             }
         }
         oracle_info
@@ -1780,15 +1745,6 @@ impl CustodyValidator {
 
     pub fn update_oracle_status(env: Env, auth: Address, oracle_address: Address, is_active: bool) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
@@ -1814,15 +1770,6 @@ impl CustodyValidator {
         reputation_score: u32,
     ) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         if reputation_score > 100 {
             panic_with_error!(&env, CustodyError::VerificationFailed);
@@ -1860,15 +1807,6 @@ impl CustodyValidator {
 
     pub fn update_config(env: Env, auth: Address, config: ValidationConfig) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
@@ -1921,22 +1859,13 @@ impl CustodyValidator {
 
     /// Update the set of asset types a registered custodian is authorised to
     /// attest for. Admin-only.
-    pub fn update_custodian_verification_types(
+    pub fn set_custodian_verification_types(
         env: Env,
         auth: Address,
         custodian_address: Address,
         verification_types: Vec<Symbol>,
     ) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
@@ -2018,15 +1947,6 @@ impl CustodyValidator {
     /// Update the weights used to combine performance metrics. Admin-only.
     pub fn update_performance_weights(env: Env, auth: Address, weights: PerformanceWeights) {
         crate::shared_admin::require_admin(&env, &auth);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, CustodyError::NotInitialized);
-            });
-
-        assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
 
