@@ -27,7 +27,7 @@ pub fn create_carbon_credit_config(
 ) -> AssetConfig {
     validate_metadata_size(&env, base_config.metadata.len(), 100);
 
-    let current_year = (env.ledger().timestamp() / 31536000) + 1970;
+    let current_year = ((env.ledger().timestamp() / 31536000) + 1970) as u32;
     if carbon_config.vintage_year < 1990 || carbon_config.vintage_year > current_year {
         panic_with_error!(&env, AssetClassError::InvalidVintage);
     }
@@ -51,7 +51,7 @@ pub fn create_carbon_credit_config(
     metadata.set(Symbol::new(&env, "carbon_offset_amount"), String::from_str(&env, &carbon_config.carbon_offset_amount.to_string()));
 
     for (key, value) in carbon_config.project_metadata {
-        metadata.set(key, value);
+        metadata.set(key, String::from_str(&env, &value.to_string()));
     }
 
     AssetConfig {

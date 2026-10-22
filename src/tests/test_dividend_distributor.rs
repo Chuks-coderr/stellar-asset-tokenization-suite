@@ -9,8 +9,8 @@ use soroban_sdk::{
 use crate::{
     compliance_registry::{ComplianceRegistry, ComplianceRegistryClient},
     dividend_distributor::{
-        DividendConfig, DividendDistributor, DividendDistributorClient, DividendError,
-        DEFAULT_MIN_CLAIM_WINDOW,
+        ClaimState, DistributionCategory, DividendConfig, DividendDistributor, DividendDistributorClient,
+        DividendError, MAX_FEE_RATE, RecurringSchedule, DEFAULT_MIN_CLAIM_WINDOW,
     },
     rwa_token::{RWAToken, RWATokenClient},
 };
@@ -125,6 +125,7 @@ fn create_distribution_returns_id_one() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -140,6 +141,7 @@ fn create_distribution_increments_id() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     let id2 = t.distributor.create_distribution(
@@ -148,6 +150,7 @@ fn create_distribution_increments_id() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id2, id1 + 1);
@@ -164,6 +167,7 @@ fn create_distribution_with_zero_amount_panics() {
         &t.currency_symbol,
         &0i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 }
@@ -179,6 +183,7 @@ fn create_distribution_with_unsupported_currency_panics() {
         &Symbol::new(&t.env, "UNKNOWN"),
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 }
@@ -195,6 +200,7 @@ fn create_distribution_by_non_admin_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 }
@@ -217,6 +223,7 @@ fn create_distribution_with_too_soon_deadline_returns_claim_deadline_too_soon() 
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     match res {
@@ -240,6 +247,7 @@ fn create_distribution_with_too_soon_deadline_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 }
@@ -255,6 +263,7 @@ fn create_distribution_with_deadline_at_minimum_window_succeeds() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -272,6 +281,7 @@ fn create_distribution_with_normal_deadline_succeeds() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -305,6 +315,7 @@ fn min_claim_window_is_configurable_via_update_config() {
         &t.currency_symbol,
         &1000i128,
         &short_deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     match res {
@@ -324,6 +335,7 @@ fn min_claim_window_is_configurable_via_update_config() {
         &t.currency_symbol,
         &1000i128,
         &ok_deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -341,6 +353,7 @@ fn get_distribution_returns_correct_data() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     let dist = t.distributor.get_distribution(&id);
@@ -373,6 +386,7 @@ fn claim_dividend_transfers_net_amount_to_claimer() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -396,6 +410,7 @@ fn claim_dividend_twice_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -419,6 +434,7 @@ fn claim_dividend_after_deadline_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -440,6 +456,7 @@ fn claim_dividend_with_zero_balance_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -461,6 +478,7 @@ fn calculate_available_dividend_returns_proportional_amount() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -482,6 +500,7 @@ fn calculate_available_dividend_returns_zero_after_claim() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -506,6 +525,7 @@ fn claim_on_deactivated_distribution_panics() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -540,6 +560,7 @@ fn update_config_changes_fee_rate() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     let claimed = t.distributor.claim_dividend(&id, &claimer);
@@ -565,6 +586,7 @@ fn migrate_preserves_config_and_currencies() {
         &t.currency_symbol,
         &500i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -592,6 +614,7 @@ fn migrate_preserves_claim_state() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
 
@@ -668,6 +691,7 @@ fn migrate_with_empty_distributions() {
         &t.currency_symbol,
         &500i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     assert_eq!(id, 1);
@@ -699,6 +723,7 @@ fn migrate_preserves_auto_distribution_config() {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     );
     let dist = t.distributor.get_distribution(&id);
@@ -866,6 +891,7 @@ fn create_distribution(t: &TestEnv, token_address: &Address) -> u64 {
         &t.currency_symbol,
         &1000i128,
         &deadline,
+        &DistributionCategory::Regular,
         &Map::new(&t.env),
     )
 }
@@ -1035,4 +1061,197 @@ fn admin_direct_unfreeze_is_rejected() {
         .try_unfreeze_all_distributions(&t.admin, &1u64, &payload);
     assert!(res.is_err());
     assert!(t.distributor.is_distributions_frozen());
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Issue #138: dividend history query with pagination
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn get_distribution_history_returns_paginated_page() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+
+    // Create 3 distributions
+    let id1 = t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &1000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+    let id2 = t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &2000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+    let id3 = t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &3000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+
+    let page = t.distributor.get_distribution_history(&0u64, &10u64);
+    assert_eq!(page.total, 3);
+    assert_eq!(page.offset, 0);
+    assert_eq!(page.limit, 10);
+    assert!(!page.has_more);
+    assert_eq!(page.distributions.len(), 3);
+
+    // Newest first: id3, id2, id1
+    assert_eq!(page.distributions.get(0).unwrap().distribution_id, id3);
+    assert_eq!(page.distributions.get(1).unwrap().distribution_id, id2);
+    assert_eq!(page.distributions.get(2).unwrap().distribution_id, id1);
+}
+
+#[test]
+fn get_distribution_history_pagination_offset_and_limit() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+
+    for i in 0..5 {
+        t.distributor.create_distribution(
+            &t.admin,
+            &t.token.address,
+            &t.currency_symbol,
+            &((100 * (i + 1)) as i128),
+            &deadline,
+            &Map::new(&t.env),
+        );
+    }
+
+    // Page 1: offset 0, limit 2
+    let p1 = t.distributor.get_distribution_history(&0u64, &2u64);
+    assert_eq!(p1.total, 5);
+    assert_eq!(p1.offset, 0);
+    assert_eq!(p1.limit, 2);
+    assert!(p1.has_more);
+    assert_eq!(p1.distributions.len(), 2);
+    // Newest first: ids 5, 4
+    assert_eq!(p1.distributions.get(0).unwrap().distribution_id, 5);
+    assert_eq!(p1.distributions.get(1).unwrap().distribution_id, 4);
+
+    // Page 2: offset 2, limit 2
+    let p2 = t.distributor.get_distribution_history(&2u64, &2u64);
+    assert_eq!(p2.total, 5);
+    assert_eq!(p2.offset, 2);
+    assert_eq!(p2.limit, 2);
+    assert!(p2.has_more);
+    assert_eq!(p2.distributions.len(), 2);
+    assert_eq!(p2.distributions.get(0).unwrap().distribution_id, 3);
+    assert_eq!(p2.distributions.get(1).unwrap().distribution_id, 2);
+
+    // Page 3: offset 4, limit 2 — last item only
+    let p3 = t.distributor.get_distribution_history(&4u64, &2u64);
+    assert_eq!(p3.total, 5);
+    assert_eq!(p3.offset, 4);
+    assert_eq!(p3.limit, 2);
+    assert!(!p3.has_more);
+    assert_eq!(p3.distributions.len(), 1);
+    assert_eq!(p3.distributions.get(0).unwrap().distribution_id, 1);
+}
+
+#[test]
+fn get_distribution_history_offset_beyond_total_returns_empty() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+    t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &1000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+
+    let page = t.distributor.get_distribution_history(&10u64, &5u64);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.offset, 1);
+    assert_eq!(page.distributions.len(), 0);
+    assert!(!page.has_more);
+}
+
+#[test]
+fn get_distribution_history_limit_is_capped() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+
+    for _ in 0..3 {
+        t.distributor.create_distribution(
+            &t.admin,
+            &t.token.address,
+            &t.currency_symbol,
+            &1000i128,
+            &deadline,
+            &Map::new(&t.env),
+        );
+    }
+
+    // Requesting limit 1000 should be capped to 100
+    let page = t.distributor.get_distribution_history(&0u64, &1000u64);
+    assert_eq!(page.limit, 100);
+    assert_eq!(page.distributions.len(), 3);
+}
+
+#[test]
+fn get_distribution_history_zero_limit_uses_default_cap() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+    t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &1000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+
+    let page = t.distributor.get_distribution_history(&0u64, &0u64);
+    assert_eq!(page.limit, 100);
+    assert_eq!(page.distributions.len(), 1);
+}
+
+#[test]
+fn get_distribution_history_includes_inactive_distributions() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+
+    let id1 = t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &1000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+    let id2 = t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &2000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+
+    // Deactivate the first distribution
+    t.distributor.deactivate_distribution(&t.admin, &id1);
+
+    let page = t.distributor.get_distribution_history(&0u64, &10u64);
+    assert_eq!(page.total, 2);
+    assert_eq!(page.distributions.len(), 2);
+    // Both active and inactive should appear
+    let ids: Vec<u64> = page
+        .distributions
+        .iter()
+        .map(|d| d.distribution_id)
+        .collect();
+    assert!(ids.contains(&id1));
+    assert!(ids.contains(&id2));
 }
