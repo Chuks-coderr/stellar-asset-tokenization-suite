@@ -173,6 +173,7 @@ pub struct VerificationTypeConfig {
     pub iot_monitoring_required: bool,
     pub satellite_verification: bool,
     pub legal_verification_required: bool,
+    pub audit_required: bool,
 }
 
 #[contracttype]
@@ -747,7 +748,7 @@ impl CustodyValidator {
         Self::check_version(&env);
 
         let registered_oracle = oracle_address.clone();
-        Self::put_oracle(env, oracle_address, name, jurisdiction);
+        Self::put_oracle(env.clone(), oracle_address, name, jurisdiction);
 
         // Issue #166: record the registration in the audit trail.
         Self::append_audit_event(
@@ -890,6 +891,7 @@ impl CustodyValidator {
             iot_monitoring_required: false,
             satellite_verification: true,
             legal_verification_required: true,
+            audit_required: true,
         }
     }
 
@@ -911,6 +913,7 @@ impl CustodyValidator {
             iot_monitoring_required: true,
             satellite_verification: false,
             legal_verification_required: false,
+            audit_required: true,
         }
     }
 
@@ -932,6 +935,7 @@ impl CustodyValidator {
             iot_monitoring_required: false,
             satellite_verification: false,
             legal_verification_required: true,
+            audit_required: true,
         }
     }
 
@@ -952,6 +956,7 @@ impl CustodyValidator {
             iot_monitoring_required: true,
             satellite_verification: false,
             legal_verification_required: false,
+            audit_required: false,
         }
     }
 
@@ -972,7 +977,21 @@ impl CustodyValidator {
             iot_monitoring_required: false,
             satellite_verification: false,
             legal_verification_required: true,
+            audit_required: true,
         }
+    }
+
+    /// Caps a dispute penalty at the bond posted for the dispute and records
+    /// the resulting slash. Token movement itself is settled by the caller /
+    /// off-chain bond custodian, which is why only the capped amount is
+    /// returned and emitted here.
+    fn apply_bond_slash(env: &Env, dispute: &DisputeRecord, penalty_amount: i128) -> i128 {
+        let slashed = penalty_amount.max(0).min(dispute.bond_amount);
+        env.events().publish(
+            (Symbol::new(env, "bond_slashed"), dispute.custodian.clone()),
+            (slashed, dispute.dispute_id),
+        );
+        slashed
     }
 
     pub fn resolve_dispute(
@@ -1921,7 +1940,7 @@ impl CustodyValidator {
 
     /// Update the set of asset types a registered custodian is authorised to
     /// attest for. Admin-only.
-    pub fn update_custodian_verification_types(
+    pub fn set_custodian_verification_types(
         env: Env,
         auth: Address,
         custodian_address: Address,

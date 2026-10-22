@@ -333,7 +333,7 @@ fn migrate_preserves_transfer_limits() {
 
 #[test]
 fn migrate_preserves_compliance_rules() {
-    let (_, _, client) = setup();
+    let (env, _, client) = setup();
     let rules = client.get_compliance_rules();
 
     // Initial seeding creates 3 rules
@@ -341,7 +341,7 @@ fn migrate_preserves_compliance_rules() {
 
     // Rules should be accessible
     let first = rules.get(0).unwrap();
-    assert!(!first.rule_name.is_empty());
+    assert!(first.name != Symbol::new(&env, ""));
 }
 
 #[test]

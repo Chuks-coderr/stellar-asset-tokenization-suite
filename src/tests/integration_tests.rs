@@ -30,7 +30,6 @@ struct IntegrationTestEnv {
     custody_validator: CustodyValidatorClient<'static>,
     oracle1: Address,
     base_currency: Address,
-    oracle1: Address,
 }
 
 fn setup_integration_test() -> IntegrationTestEnv {
@@ -51,7 +50,7 @@ fn setup_integration_test() -> IntegrationTestEnv {
     let dividend_id = env.register_contract(None, DividendDistributor);
     let dividend_distributor = DividendDistributorClient::new(&env, &dividend_id);
     let supported_currencies = Vec::from_array(&env, [Symbol::new(&env, "USDC")]);
-    dividend_distributor.initialize(&admin, &admin, supported_currencies);
+    dividend_distributor.initialize(&admin, &admin, &supported_currencies);
 
     // Deploy Asset Factory
     let factory_id = env.register_contract(None, AssetFactory);
@@ -129,7 +128,6 @@ fn setup_integration_test() -> IntegrationTestEnv {
         custody_validator,
         oracle1,
         base_currency,
-        oracle1,
     }
 }
 
@@ -163,7 +161,7 @@ fn test_complete_asset_lifecycle() {
     let template = AssetTemplate {
         asset_class: AssetClass::RealEstate,
         base_config: asset_config.clone(),
-        wasm_hash,
+        wasm_hash: wasm_hash.clone(),
         is_active: true,
         version: 1,
     };
@@ -198,8 +196,8 @@ fn test_complete_asset_lifecycle() {
         aml_flags: Vec::new(&t.env),
     };
 
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, kyc_status.clone());
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, kyc_status);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, &kyc_status.clone());
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, &kyc_status);
 
     // Step 4: Transfer tokens to user1
     t.rwa_token.transfer(&t.admin, &t.user1, &100_000i128);
@@ -216,18 +214,18 @@ fn test_complete_asset_lifecycle() {
         &t.rwa_token.address.clone(),
         &Symbol::new(&t.env, "USDC"),
         &10_000i128,
-        &t.env.ledger().timestamp() + 86400 * 30,
-        Map::new(&t.env),
+        &(t.env.ledger().timestamp() + 86400 * 30),
+        &Map::new(&t.env),
     );
 
     assert_eq!(distribution_id, 1);
 
     // Step 6: User1 claims dividend
-    let claimed = t.dividend_distributor.claim_dividend(distribution_id, t.user1.clone());
+    let claimed = t.dividend_distributor.claim_dividend(&distribution_id, &t.user1.clone());
     assert!(claimed > 0);
 
     // Step 7: Verify claim info
-    let claim_info = t.dividend_distributor.get_claim_info(distribution_id, t.user1.clone());
+    let claim_info = t.dividend_distributor.get_claim_info(&distribution_id, &t.user1.clone());
     assert!(claim_info.is_some());
 }
 
@@ -260,7 +258,7 @@ fn test_compliance_enforced_trading() {
         risk_score: 3,
         aml_flags: Vec::new(&t.env),
     };
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, kyc_verified);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, &kyc_verified);
 
     // Set up KYC for user2 (not verified)
     let kyc_unverified = KYCStatus {
@@ -272,15 +270,15 @@ fn test_compliance_enforced_trading() {
         risk_score: 5,
         aml_flags: Vec::new(&t.env),
     };
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, kyc_unverified);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, &kyc_unverified);
 
     // Transfer tokens to user1
     t.rwa_token.transfer(&t.admin, &t.user1, &100_000i128);
 
     // Transfer from verified user1 to unverified user2 should fail
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.rwa_token.transfer(&t.user1, &t.user2, &1000i128);
-    });
+    }));
     assert!(result.is_err());
 
     // Now verify user2
@@ -293,7 +291,7 @@ fn test_compliance_enforced_trading() {
         risk_score: 3,
         aml_flags: Vec::new(&t.env),
     };
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, kyc_verified2);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, &kyc_verified2);
 
     // Transfer should now succeed
     t.rwa_token.transfer(&t.user1, &t.user2, &1000i128);
@@ -332,8 +330,8 @@ fn test_secondary_market_trading() {
         aml_flags: Vec::new(&t.env),
     };
 
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, kyc_status.clone());
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, kyc_status);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, &kyc_status.clone());
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, &kyc_status);
 
     // Transfer tokens to user1 for selling
     t.rwa_token.transfer(&t.admin, &t.user1, &10_000i128);
@@ -345,7 +343,7 @@ fn test_secondary_market_trading() {
         &Symbol::new(&t.env, "sell"),
         &100i128, // price
         &1000i128, // amount
-        &t.env.ledger().timestamp() + 86400, // expiry
+        &(t.env.ledger().timestamp() + 86400), // expiry
         &100i128, // min_fill
     );
 
@@ -356,7 +354,7 @@ fn test_secondary_market_trading() {
     assert_eq!(user1_balance.amount, 9_000); // 10,000 - 1,000 escrowed
 
     // Fill the sell order (user2 buys)
-    t.secondary_market.fill_order(&t.user2, sell_order_id, &500i128);
+    t.secondary_market.fill_order(&t.user2, &sell_order_id, &500i128);
 
     // Verify trade execution
     let user1_balance = t.rwa_token.get_balance(&t.user1);
@@ -398,8 +396,8 @@ fn test_blacklist_enforcement() {
         aml_flags: Vec::new(&t.env),
     };
 
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, kyc_status.clone());
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, kyc_status);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, &kyc_status.clone());
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, &kyc_status);
 
     // Transfer tokens to user1
     t.rwa_token.transfer(&t.admin, &t.user1, &100_000i128);
@@ -412,9 +410,9 @@ fn test_blacklist_enforcement() {
     );
 
     // Transfer from blacklisted user should fail
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.rwa_token.transfer(&t.user1, &t.user2, &1000i128);
-    });
+    }));
     assert!(result.is_err());
 
     // Remove from blacklist
@@ -458,9 +456,9 @@ fn test_token_locking_and_voting_power() {
     assert_eq!(balance.voting_power, 10_000);
 
     // Try to transfer locked tokens (should fail for locked amount)
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.rwa_token.transfer(&t.user1, &t.user2, &95_000i128);
-    });
+    }));
     assert!(result.is_err());
 
     // Transfer unlocked amount should succeed
@@ -508,8 +506,8 @@ fn test_multi_currency_dividend_distribution() {
         aml_flags: Vec::new(&t.env),
     };
 
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, kyc_status.clone());
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, kyc_status);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, &kyc_status.clone());
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, &kyc_status);
 
     // Transfer tokens to users
     t.rwa_token.transfer(&t.admin, &t.user1, &100_000i128);
@@ -522,17 +520,17 @@ fn test_multi_currency_dividend_distribution() {
     let distribution_ids = t.dividend_distributor.multi_ccy_distributions(
         &t.admin,
         &t.rwa_token.address.clone(),
-        currencies,
-        amounts,
-        &t.env.ledger().timestamp() + 86400 * 30,
-        Map::new(&t.env),
+        &currencies,
+        &amounts,
+        &(t.env.ledger().timestamp() + 86400 * 30),
+        &Map::new(&t.env),
     );
 
     assert_eq!(distribution_ids.len(), 1);
 
     // Both users claim dividends
-    let claimed1 = t.dividend_distributor.claim_dividend(distribution_ids.get(0).unwrap(), t.user1.clone());
-    let claimed2 = t.dividend_distributor.claim_dividend(distribution_ids.get(0).unwrap(), t.user2.clone());
+    let claimed1 = t.dividend_distributor.claim_dividend(&distribution_ids.get(0).unwrap(), &t.user1.clone());
+    let claimed2 = t.dividend_distributor.claim_dividend(&distribution_ids.get(0).unwrap(), &t.user2.clone());
 
     // user2 should claim more (has 2x tokens)
     assert!(claimed2 > claimed1);
@@ -564,9 +562,9 @@ fn test_emergency_pause_and_recovery() {
     t.rwa_token.pause(&t.admin);
 
     // Transfer should fail while paused
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.rwa_token.transfer(&t.user1, &t.user2, &1000i128);
-    });
+    }));
     assert!(result.is_err());
 
     // Unpause token
@@ -609,7 +607,7 @@ fn test_asset_factory_emergency_pause_all() {
         let template = AssetTemplate {
             asset_class: AssetClass::RealEstate,
             base_config: asset_config,
-            wasm_hash,
+            wasm_hash: wasm_hash.clone(),
             is_active: true,
             version: 1,
         };
@@ -657,7 +655,7 @@ fn test_transfer_limits_enforcement() {
         aml_flags: Vec::new(&t.env),
     };
 
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, kyc_status);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, &kyc_status);
 
     // Transfer tokens to user1
     t.rwa_token.transfer(&t.admin, &t.user1, &100_000i128);
@@ -676,7 +674,7 @@ fn test_transfer_limits_enforcement() {
         last_reset_annual: 0,
     };
 
-    t.compliance_registry.set_transfer_limits(&t.admin, &t.user1, limits);
+    t.compliance_registry.set_transfer_limits(&t.admin, &t.user1, &limits);
 
     // Transfer within limit should succeed
     t.rwa_token.transfer(&t.user1, &t.user2, &1000i128);
@@ -685,9 +683,9 @@ fn test_transfer_limits_enforcement() {
     assert_eq!(user2_balance.amount, 1000);
 
     // Transfer exceeding limit should fail
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.rwa_token.transfer(&t.user1, &t.user2, &5000i128);
-    });
+    }));
     assert!(result.is_err());
 }
 
@@ -724,8 +722,8 @@ fn test_full_workflow_end_to_end() {
         aml_flags: Vec::new(&t.env),
     };
 
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, kyc_status.clone());
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, kyc_status);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, &kyc_status.clone());
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user2, &kyc_status);
 
     // Step 3: Distribute tokens to users
     t.rwa_token.transfer(&t.admin, &t.user1, &200_000i128);
@@ -741,13 +739,13 @@ fn test_full_workflow_end_to_end() {
         &t.rwa_token.address.clone(),
         &Symbol::new(&t.env, "USDC"),
         &50_000i128,
-        &t.env.ledger().timestamp() + 86400 * 30,
-        Map::new(&t.env),
+        &(t.env.ledger().timestamp() + 86400 * 30),
+        &Map::new(&t.env),
     );
 
     // Step 6: Users claim dividends
-    let claimed1 = t.dividend_distributor.claim_dividend(distribution_id, t.user1.clone());
-    let claimed2 = t.dividend_distributor.claim_dividend(distribution_id, t.user2.clone());
+    let claimed1 = t.dividend_distributor.claim_dividend(&distribution_id, &t.user1.clone());
+    let claimed2 = t.dividend_distributor.claim_dividend(&distribution_id, &t.user2.clone());
     
     assert!(claimed1 > 0);
     assert!(claimed2 > 0);
@@ -759,12 +757,12 @@ fn test_full_workflow_end_to_end() {
         &Symbol::new(&t.env, "sell"),
         &150i128,
         &10_000i128,
-        &t.env.ledger().timestamp() + 86400,
+        &(t.env.ledger().timestamp() + 86400),
         &1000i128,
     );
 
     // Step 8: Fill the order
-    t.secondary_market.fill_order(&t.user2, sell_order_id, &10_000i128);
+    t.secondary_market.fill_order(&t.user2, &sell_order_id, &10_000i128);
 
     // Step 9: Verify final state
     let user1_balance = t.rwa_token.get_balance(&t.user1);
@@ -779,15 +777,15 @@ fn test_full_workflow_end_to_end() {
     assert_eq!(user2_balance.locked_amount, 100_000);
 
     // Step 10: Verify dividend claims
-    let claim_info1 = t.dividend_distributor.get_claim_info(distribution_id, t.user1.clone());
-    let claim_info2 = t.dividend_distributor.get_claim_info(distribution_id, t.user2.clone());
+    let claim_info1 = t.dividend_distributor.get_claim_info(&distribution_id, &t.user1.clone());
+    let claim_info2 = t.dividend_distributor.get_claim_info(&distribution_id, &t.user2.clone());
     
     assert!(claim_info1.is_some());
     assert!(claim_info2.is_some());
 
     // Gas tracking: verify the full workflow stays within budget
-    let gas_used = t.env.budget().cpu_insns_consumed().unwrap_or(0);
-    let mem_bytes = t.env.budget().mem_bytes_consumed().unwrap_or(0);
+    let gas_used = t.env.budget().cpu_instruction_cost();
+    let mem_bytes = t.env.budget().memory_bytes_cost();
     
     // Full workflow should complete well within Soroban transaction limits
     // (max ~100M CPU instructions, ~40MB memory per transaction)
@@ -845,28 +843,28 @@ fn test_unauthorized_access_rejection() {
     );
 
     // Attempt to pause from non-admin should fail
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.rwa_token.pause(&t.user1);
-    });
+    }));
     assert!(result.is_err(), "Non-admin should not be able to pause");
 
     // Attempt to mint from non-admin should fail
-    let result = std::panic::catch_unwind(|| {
-        t.rwa_token.mint(&t.user1, &t.user1, 1000i128);
-    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        t.rwa_token.mint(&t.user1, &t.user1, &1000i128);
+    }));
     assert!(result.is_err(), "Non-admin should not be able to mint");
 
     // Attempt to create distribution from non-admin should fail
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         t.dividend_distributor.create_distribution(
             &t.user1,
             &t.rwa_token.address.clone(),
             &Symbol::new(&t.env, "USDC"),
             &10_000i128,
-            &t.env.ledger().timestamp() + 86400,
-            Map::new(&t.env),
+            &(t.env.ledger().timestamp() + 86400),
+            &Map::new(&t.env),
         );
-    });
+    }));
     assert!(result.is_err(), "Non-admin should not be able to create distributions");
 }
 
@@ -899,7 +897,7 @@ fn test_deploy_kyc_dividend_custody_workflow() {
         risk_score: 3,
         aml_flags: Vec::new(&t.env),
     };
-    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, kyc_status);
+    t.compliance_registry.update_kyc_status(&t.admin, &t.user1, &kyc_status);
 
     // Step 3: Transfer tokens
     t.rwa_token.transfer(&t.admin, &t.user1, &100_000i128);
@@ -910,12 +908,12 @@ fn test_deploy_kyc_dividend_custody_workflow() {
         &t.rwa_token.address.clone(),
         &Symbol::new(&t.env, "USDC"),
         &10_000i128,
-        &t.env.ledger().timestamp() + 86400 * 30,
-        Map::new(&t.env),
+        &(t.env.ledger().timestamp() + 86400 * 30),
+        &Map::new(&t.env),
     );
 
     // Step 5: Claim dividend
-    let claimed = t.dividend_distributor.claim_dividend(distribution_id, t.user1.clone());
+    let claimed = t.dividend_distributor.claim_dividend(&distribution_id, &t.user1.clone());
     assert!(claimed > 0);
 
     // Step 6: Verify custody via attestation
@@ -1044,7 +1042,7 @@ fn test_oracle_reputation_decay() {
 #[test]
 fn test_governance_proposal_categorization_and_timelock() {
     let env = Env::default();
-    env.mock_all_signatures();
+    env.mock_all_auths();
 
     let owner1 = Address::generate(&env);
     let owner2 = Address::generate(&env);
@@ -1052,19 +1050,25 @@ fn test_governance_proposal_categorization_and_timelock() {
 
     crate::shared_governance::write_governance(&env, &owner1, &owners, 2, 3600);
 
-    // Create ContractUpgrade proposal (14 day review period + 3600s timelock)
-    let payload = [1u8; 32];
-    let cat = Symbol::new(&env, "ContractUpgrade");
+    // Create a parameter-change proposal (14 day review period + 3600s timelock)
+    let payload = BytesN::from_array(&env, &[1u8; 32]);
     let prop_key = Symbol::new(&env, "upgrade_v2");
 
-    let pid = crate::shared_governance::create_proposal(env.clone(), owner1.clone(), prop_key.clone(), cat, payload);
+    let pid = crate::shared_governance::create_proposal_with_model(
+        env.clone(),
+        owner1.clone(),
+        prop_key.clone(),
+        crate::shared_governance::ProposalCategory::ParameterChange,
+        payload.clone(),
+        crate::shared_governance::VotingModel::Linear,
+    );
     assert_eq!(pid, 1);
 
     crate::shared_governance::approve(env.clone(), owner1.clone(), pid);
     crate::shared_governance::approve(env.clone(), owner2.clone(), pid);
 
     // Cannot execute immediately because review period & timelock haven't expired
-    assert!(!crate::shared_governance::can_execute(&env, pid, prop_key.clone(), payload));
+    assert!(!crate::shared_governance::can_execute(&env, pid, prop_key.clone(), payload.clone()));
 
     // Fast forward past review period (14 days = 1_209_600s) + 3600s timelock
     env.ledger().set_timestamp(env.ledger().timestamp() + 1_209_600 + 3601);

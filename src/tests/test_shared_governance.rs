@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    testutils::Address as _,
-    Address, BytesN, Env, Map, Symbol, TryFromVal as _, Vec,
+    testutils::{Address as _, Events as _},
+    Address, BytesN, Env, Map, Symbol, TryFromVal as _, TryIntoVal as _, Vec,
 };
 
 use crate::{
@@ -58,7 +58,7 @@ fn init_governance(g: &GovEnv, owners: &Vec<Address>, threshold: u32, timelock: 
 fn assert_event_published(env: &Env, name: &str) {
     let mut published = false;
     for event in env.events().all().iter() {
-        let topics = event.topics;
+        let topics = event.1;
         let topic = topics.get(0);
         if topic.is_some() {
             let sym: Option<Symbol> = topic.unwrap().try_into_val(env).ok();
