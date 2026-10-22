@@ -65,6 +65,14 @@ pub struct Balance {
     pub last_dividend_claim: u64,
 }
 
+/// A holder of the token, as returned by `get_top_holders` (Issue #109).
+#[contracttype]
+#[derive(Clone)]
+pub struct HolderInfo {
+    pub address: Address,
+    pub amount: i128,
+}
+
 #[contracttype]
 pub struct TransferRestriction {
     pub max_daily_amount: i128,
@@ -367,6 +375,9 @@ impl RWAToken {
             .unwrap_or_else(|| panic_with_error!(&env, RWATokenError::Overflow));
         env.storage().instance().set(&to, &balance);
 
+        // Issue #109 — keep the holder registry in step with the balances.
+        Self::adjust_holders(&env, &to, amount);
+
         env.events().publish(
             (Symbol::new(&env, "mint"), to.clone()),
             (amount, env.ledger().timestamp()),
@@ -402,9 +413,16 @@ impl RWAToken {
             .unwrap_or_else(|| panic_with_error!(&env, RWATokenError::Underflow));
         env.storage().instance().set(&from, &balance);
 
-        let mut token_info = Self::read_token_info(&env);
-        token_info.total_supply = token_info
-            .total_supply
+        // Issue #109 — a holder that drops to zero is no longer a holder.
+        Self::adjust_holders(&env, &from, -amount);
+
+        let mut token_info: TokenInfo = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "token_info"))
+            .unwrap_or_else(|| { panic_with_error!(&env, RWATokenError::TokenInfoNotFound); });
+
+        token_info.total_supply = token_info.total_supply
             .checked_sub(amount)
             .unwrap_or_else(|| panic_with_error!(&env, RWATokenError::Underflow));
         env.storage()
@@ -463,15 +481,81 @@ impl RWAToken {
         from.require_auth();
         Self::transfer_internal(&env, &from, &to, amount);
 
+        // Issue #109 — keep the holder registry in step with the balances.
+        Self::adjust_holders(&env, &from, -amount);
+        Self::adjust_holders(&env, &to, amount);
+
         env.events().publish(
             (Symbol::new(&env, "transfer"), from),
             (to, amount, env.ledger().timestamp()),
         );
     }
 
-    // ── allowances (delegated transfers) ──────────────────────────────────────
+    /// Admin-initiated transfer that does not need the holder's consent.
+    ///
+    /// Issue #107 — this is the compliance-enforced seizure path: the admin
+    /// authorizes the transfer on its own authority, the holder does not have
+    /// to sign it, and the compliance check is not applied to the holder
+    /// (the point of a seizure is that the holder does not currently comply).
+    /// The token must not be paused or frozen, and the balance is still
+    /// checked, so a seizure can never mint tokens.
+    ///
+    /// The `forced_transfer` event is distinct from `transfer` and records
+    /// the admin and the reason for the audit trail.
+    pub fn force_transfer(
+        env: Env,
+        admin: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+        reason: Symbol,
+    ) {
+        if amount <= 0 {
+            panic_with_error!(&env, RWATokenError::InvalidAmount);
+        }
 
-    fn read_allowances(env: &Env) -> Map<(Address, Address), i128> {
+        crate::shared_admin::require_admin(&env, &admin);
+
+        Self::check_version(&env);
+
+        let token_info: TokenInfo = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "token_info"))
+            .unwrap_or_else(|| { panic_with_error!(&env, RWATokenError::TokenInfoNotFound); });
+
+        if token_info.is_paused || token_info.is_frozen {
+            panic_with_error!(&env, RWATokenError::TransferPaused);
+        }
+
+        let mut from_balance = Self::get_balance(env.clone(), from.clone());
+        let mut to_balance = Self::get_balance(env.clone(), to.clone());
+
+        if from_balance.amount < amount {
+            panic_with_error!(&env, RWATokenError::InsufficientBalance);
+        }
+
+        from_balance.amount = from_balance.amount
+            .checked_sub(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, RWATokenError::Underflow));
+        to_balance.amount = to_balance.amount
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, RWATokenError::Overflow));
+
+        env.storage().instance().set(&from, &from_balance);
+        env.storage().instance().set(&to, &to_balance);
+
+        // Issue #109 — keep the holder registry in step with the balances.
+        Self::adjust_holders(&env, &from, -amount);
+        Self::adjust_holders(&env, &to, amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "forced_transfer"), from.clone()),
+            (admin, to, amount, reason, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn get_token_info(env: Env) -> TokenInfo {
         env.storage()
             .instance()
             .get(&allowances_key(env))
@@ -590,18 +674,89 @@ impl RWAToken {
         balance.amount.saturating_sub(balance.locked_amount)
     }
 
-    /// Active (non-expired) lock slots for `owner`.
-    pub fn get_lock_slots(env: Env, owner: Address) -> Vec<LockSlot> {
-        Self::refresh_balance(&env, &owner);
-        Self::read_locks(&env)
-            .get(owner)
-            .unwrap_or_else(|| Vec::new(&env))
+    /// Records a balance change in the holder registry.
+    ///
+    /// Issue #109 — the contract keeps one balance per address in instance
+    /// storage, and Soroban offers no way to iterate instance storage, so the
+    /// holders are tracked explicitly. The balance record stays authoritative;
+    /// the registry mirrors it so the holder views do not have to read every
+    /// balance. An entry is dropped once the balance reaches zero, so the
+    /// registry only ever holds non-zero holders.
+    fn adjust_holders(env: &Env, address: &Address, amount: i128) {
+        let key = Symbol::new(env, "holders");
+        let mut holders: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(Map::new(env));
+
+        let updated = holders.get(address.clone()).unwrap_or(0) + amount;
+        if updated > 0 {
+            holders.set(address.clone(), updated);
+        } else {
+            holders.remove(address.clone());
+        }
+
+        env.storage().instance().set(&key, &holders);
     }
 
-    // ── locking & vesting ─────────────────────────────────────────────────────
+    /// The number of addresses that currently hold a non-zero balance.
+    pub fn get_holder_count(env: Env) -> u32 {
+        let holders: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "holders"))
+            .unwrap_or(Map::new(&env));
 
-    /// Locks tokens until `lock_period` seconds have elapsed. Legacy entry
-    /// point; equivalent to a cliff vesting schedule.
+        holders.len()
+    }
+
+    /// The largest holders, ordered by balance (descending).
+    ///
+    /// `limit` is capped at 100 so a single call cannot ask for an unbounded
+    /// ranking. The registry is one storage entry, so the ranking is computed
+    /// in memory rather than by scanning the contract's storage.
+    pub fn get_top_holders(env: Env, limit: u32) -> Vec<HolderInfo> {
+        const MAX_TOP_HOLDERS: u32 = 100;
+
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+        let limit = if limit > MAX_TOP_HOLDERS {
+            MAX_TOP_HOLDERS
+        } else {
+            limit
+        };
+
+        let holders: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "holders"))
+            .unwrap_or(Map::new(&env));
+
+        let mut ranked: Vec<HolderInfo> = Vec::new(&env);
+        for entry in holders.iter() {
+            let (address, amount) = entry;
+            let holder = HolderInfo { address, amount };
+
+            // Insert in descending order of balance.
+            let mut index = 0u32;
+            while index < ranked.len() {
+                if ranked.get(index).unwrap().amount <= amount {
+                    break;
+                }
+                index += 1;
+            }
+            ranked.insert(index, holder);
+        }
+
+        while ranked.len() > limit {
+            ranked.pop_back();
+        }
+
+        ranked
+    }
+
     pub fn lock_tokens(env: Env, auth: Address, owner: Address, amount: i128, lock_period: u64) {
         Self::lock_tokens_with_vesting(env, auth, owner, amount, lock_period, VestingType::Cliff);
     }
