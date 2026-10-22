@@ -2533,3 +2533,280 @@ fn no_oracle_configured_skips_oracle_validation() {
     assert!(order_id > 0);
     assert!(!t.market.is_circuit_breaker_tripped(&t.token.address));
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Issue #144: TWAP order execution
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn twap_order_executes_in_slices() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &500i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Seller places 5 asks of 20 RWA at price 10.
+    for _ in 0..5 {
+        t.market.place_order(
+            &seller,
+            &t.token.address,
+            &Symbol::new(&t.env, "sell"),
+            &10i128,
+            &20i128,
+            &future_expiry(&t.env),
+            &0i128,
+        );
+    }
+
+    // TWAP buy: 100 RWA in 5 slices of 20, limit price 10, interval 60s.
+    let filled = t.market.place_twap_order(
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &5u32,
+        &60u64,
+        &10i128,
+    );
+    assert_eq!(filled, 100);
+    assert_eq!(t.token.get_balance(&buyer).amount, 100);
+}
+
+#[test]
+fn twap_order_partial_fill_when_liquidity_exhausted() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &30i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Seller places 1 ask of 30 RWA at price 10.
+    t.market.place_order(
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &10i128,
+        &30i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+
+    // TWAP buy: 100 RWA in 5 slices, but only 30 available.
+    let filled = t.market.place_twap_order(
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &5u32,
+        &60u64,
+        &10i128,
+    );
+    assert_eq!(filled, 30);
+    assert_eq!(t.token.get_balance(&buyer).amount, 30);
+}
+
+#[test]
+fn twap_order_respects_limit_price() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &100i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Ask at price 20, but TWAP limit is 10.
+    t.market.place_order(
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &20i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+
+    let res = t.market.try_place_twap_order(
+        &buyer,
+        &t.token.address,
+        &Symbol::new(&t.env, "buy"),
+        &100i128,
+        &5u32,
+        &60u64,
+        &10i128,
+    );
+    assert!(res.is_err());
+    assert_eq!(t.token.get_balance(&buyer).amount, 0);
+}
+
+#[test]
+fn twap_sell_order_executes_against_bids() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let seller = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    t.token.transfer(&t.admin, &seller, &100i128);
+    verify_kyc(&t, &buyer);
+    verify_kyc(&t, &seller);
+
+    // Buyer places 5 bids of 20 RWA at price 10.
+    for _ in 0..5 {
+        t.market.place_order(
+            &buyer,
+            &t.token.address,
+            &Symbol::new(&t.env, "buy"),
+            &10i128,
+            &20i128,
+            &future_expiry(&t.env),
+            &0i128,
+        );
+    }
+
+    // TWAP sell: 100 RWA in 5 slices, limit price 10.
+    let filled = t.market.place_twap_order(
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &5u32,
+        &60u64,
+        &10i128,
+    );
+    assert_eq!(filled, 100);
+    assert_eq!(t.token.get_balance(&seller).amount, 0);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Issue #145: maker balance verification before sell orders
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn place_sell_order_insufficient_balance_rejected() {
+    let t = setup();
+    let seller = Address::generate(&t.env);
+    // Seller has no RWA tokens.
+
+    let res = t.market.try_place_order(
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn place_sell_order_partial_balance_rejected() {
+    let t = setup();
+    let seller = Address::generate(&t.env);
+    t.token.transfer(&t.admin, &seller, &30i128); // only 30, trying to sell 50
+
+    let res = t.market.try_place_order(
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &50i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn place_sell_order_sufficient_balance_succeeds() {
+    let t = setup();
+    let seller = Address::generate(&t.env);
+    t.token.transfer(&t.admin, &seller, &100i128);
+
+    let order_id = t.market.place_order(
+        &seller,
+        &t.token.address,
+        &Symbol::new(&t.env, "sell"),
+        &100i128,
+        &100i128,
+        &future_expiry(&t.env),
+        &0i128,
+    );
+    assert_eq!(order_id, 1);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Issue #146: order book depth aggregation
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn order_book_depth_aggregates_bids_within_range() {
+    let t = setup();
+    let buyer = Address::generate(&t.env);
+    let base_admin = StellarAssetClient::new(&t.env, &t.base_token.address);
+    base_admin.mint(&buyer, &1_000_000i128);
+    verify_kyc(&t, &buyer);
+
+    // Bids at 100 (20 RWA), 90 (30 RWA), 80 (40 RWA), 50 (10 RWA — out of 10% range).
+    t.market.place_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"), &100i128, &20i128, &future_expiry(&t.env), &0i128);
+    t.market.place_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"), &90i128, &30i128, &future_expiry(&t.env), &0i128);
+    t.market.place_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"), &80i128, &40i128, &future_expiry(&t.env), &0i128);
+    t.market.place_order(&buyer, &t.token.address, &Symbol::new(&t.env, "buy"), &50i128, &10i128, &future_expiry(&t.env), &0i128);
+
+    let depth = t.market.get_order_book_depth(&t.token.address, &Symbol::new(&t.env, "buy"), &1000u64);
+    assert_eq!(depth.best_price, 100);
+    // 10% of 100 = 10, so min price = 90. Levels at 100 and 90 are in range.
+    assert_eq!(depth.total_amount, 50); // 20 + 30
+    assert_eq!(depth.order_count, 2);
+    assert_eq!(depth.levels.len(), 2);
+}
+
+#[test]
+fn order_book_depth_aggregates_asks_within_range() {
+    let t = setup();
+    let seller = Address::generate(&t.env);
+    t.token.transfer(&t.admin, &seller, &500i128);
+    verify_kyc(&t, &seller);
+
+    // Asks at 100 (20 RWA), 110 (30 RWA), 120 (40 RWA), 200 (10 RWA — out of 10% range).
+    t.market.place_order(&seller, &t.token.address, &Symbol::new(&t.env, "sell"), &100i128, &20i128, &future_expiry(&t.env), &0i128);
+    t.market.place_order(&seller, &t.token.address, &Symbol::new(&t.env, "sell"), &110i128, &30i128, &future_expiry(&t.env), &0i128);
+    t.market.place_order(&seller, &t.token.address, &Symbol::new(&t.env, "sell"), &120i128, &40i128, &future_expiry(&t.env), &0i128);
+    t.market.place_order(&seller, &t.token.address, &Symbol::new(&t.env, "sell"), &200i128, &10i128, &future_expiry(&t.env), &0i128);
+
+    let depth = t.market.get_order_book_depth(&t.token.address, &Symbol::new(&t.env, "sell"), &1000u64);
+    assert_eq!(depth.best_price, 100);
+    // 10% of 100 = 10, so max price = 110. Levels at 100 and 110 are in range.
+    assert_eq!(depth.total_amount, 50); // 20 + 30
+    assert_eq!(depth.order_count, 2);
+    assert_eq!(depth.levels.len(), 2);
+}
+
+#[test]
+fn order_book_depth_empty_book() {
+    let t = setup();
+    let depth = t.market.get_order_book_depth(&t.token.address, &Symbol::new(&t.env, "buy"), &1000u64);
+    assert_eq!(depth.best_price, 0);
+    assert_eq!(depth.total_amount, 0);
+    assert_eq!(depth.order_count, 0);
+    assert_eq!(depth.levels.len(), 0);
+}
+
+#[test]
+fn order_book_depth_invalid_side_rejected() {
+    let t = setup();
+    let res = t.market.try_get_order_book_depth(
+        &t.token.address,
+        &Symbol::new(&t.env, "invalid"),
+        &1000u64,
+    );
+    assert!(res.is_err());
+}
