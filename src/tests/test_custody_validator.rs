@@ -140,7 +140,7 @@ fn update_verification_types_enables_new_type() {
         Vec::from_array(&env, [Symbol::new(&env, "real_estate")]),
     );
 
-    client.update_custodian_verification_types(
+    client.set_custodian_verification_types(
         &admin,
         &custodian,
         &Vec::from_array(&env, [Symbol::new(&env, "commodities")]),
@@ -177,7 +177,7 @@ fn update_verification_types_by_non_admin_panics() {
     );
 
     let attacker = Address::generate(&env);
-    client.update_custodian_verification_types(
+    client.set_custodian_verification_types(
         &attacker,
         &custodian,
         &Vec::from_array(&env, [Symbol::new(&env, "commodities")]),
