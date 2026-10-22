@@ -2,11 +2,12 @@
 
 use soroban_sdk::{
     testutils::Address as _,
+    testutils::Ledger as _,
     Address, Env, Symbol, Vec,
 };
 
 use crate::compliance_registry::{
-    ComplianceRegistry, ComplianceRegistryClient, DelegatedCheck, KYCStatus, RiskThresholds,
+    ComplianceRegistry, ComplianceRegistryClient, ComplianceError, KYCStatus, KycState,
     TransferLimits,
 };
 
@@ -413,240 +414,200 @@ fn data_integrity_with_complex_state() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Issue #122: Delegated compliance verification for third-party integrators
+// Issue #113: calendar-aligned transfer limit resets
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// 2026-01-01T00:00:00Z
+const NEW_YEAR_2026: u64 = 1_767_225_600;
+/// 2026-01-02T00:00:00Z
+const NEXT_DAY_2026: u64 = 1_767_312_000;
+/// 2026-02-01T00:00:00Z
+const FEB_2026: u64 = 1_769_904_000;
+/// 2026-06-01T00:00:00Z
+const JUN_2026: u64 = 1_780_268_800;
+/// 2027-01-01T00:00:00Z
+const NEW_YEAR_2027: u64 = 1_798_761_600;
+
+fn limits(
+    daily: i128,
+    monthly: i128,
+    annual: i128,
+    last_reset: u64,
+) -> TransferLimits {
+    TransferLimits {
+        daily_limit: daily,
+        monthly_limit: monthly,
+        annual_limit: annual,
+        remaining_daily: daily,
+        remaining_monthly: monthly,
+        remaining_annual: annual,
+        last_reset_daily: last_reset,
+        last_reset_monthly: last_reset,
+        last_reset_annual: last_reset,
+    }
+}
+
 #[test]
-fn test_delegate_registration() {
+fn daily_limit_resets_at_the_utc_midnight_boundary() {
     let (env, admin, client) = setup();
-    let delegate = Address::generate(&env);
     let user = Address::generate(&env);
 
-    client.delegate_compliance_check(&admin, &delegate, &user);
+    // 2026-01-01T23:00:00Z
+    env.ledger()
+        .set_timestamp(NEW_YEAR_2026 + 23 * 3_600);
+    client.set_transfer_limits(&admin, &user, &limits(100, 1_000, 10_000, 0));
 
-    let delegates = client.list_delegates();
-    assert_eq!(delegates.len(), 1);
-    assert_eq!(delegates.get(0).unwrap(), delegate);
+    // Spend the whole daily allowance.
+    assert!(client.check_transfer_limits(&user, &100));
+    assert!(!client.check_transfer_limits(&user, &1));
+
+    // 2026-01-01T23:30:00Z — still the same UTC day, so no reset yet.
+    env.ledger()
+        .set_timestamp(NEW_YEAR_2026 + 23 * 3_600 + 1_800);
+    assert!(!client.check_transfer_limits(&user, &1));
+
+    // 2026-01-02T00:00:00Z — the daily window rolls over with the calendar,
+    // not 24 hours after the previous reset.
+    env.ledger().set_timestamp(NEXT_DAY_2026);
+    assert!(client.check_transfer_limits(&user, &100));
 }
 
 #[test]
-fn test_submit_external_check() {
+fn monthly_limit_resets_on_the_first_of_the_month() {
     let (env, admin, client) = setup();
-    let delegate = Address::generate(&env);
     let user = Address::generate(&env);
 
-    client.delegate_compliance_check(&admin, &delegate, &user);
-
-    client.submit_external_check(&delegate, &user, &true, &Symbol::new(&env, "hash123"));
-
-    let checks: Vec<DelegatedCheck> = client.get_external_checks(&user);
-    assert_eq!(checks.len(), 1);
-    let check = checks.get(0).unwrap();
-    assert_eq!(check.delegate, delegate);
-    assert_eq!(check.user, user);
-    assert!(check.result);
-    assert_eq!(check.evidence_hash, Symbol::new(&env, "hash123"));
-}
-
-#[test]
-#[should_panic]
-fn test_submit_external_check_unauthorized() {
-    let (env, admin, client) = setup();
-    let delegate = Address::generate(&env);
-    let non_delegate = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    // Register `delegate` but attempt to submit as `non_delegate`.
-    client.delegate_compliance_check(&admin, &delegate, &user);
-    client.submit_external_check(&non_delegate, &user, &true, &Symbol::new(&env, "hash"));
-}
-
-#[test]
-#[should_panic]
-fn test_remove_delegate() {
-    let (env, admin, client) = setup();
-    let delegate = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    // Register the delegate and verify they can submit.
-    client.delegate_compliance_check(&admin, &delegate, &user);
-    client.submit_external_check(&delegate, &user, &true, &Symbol::new(&env, "hash"));
-
-    // Remove the delegate — they should no longer be able to submit.
-    client.remove_delegate(&admin, &delegate);
-    let delegates = client.list_delegates();
-    assert_eq!(delegates.len(), 0);
-
-    // This submission must panic because the delegate is no longer registered.
-    client.submit_external_check(&delegate, &user, &true, &Symbol::new(&env, "hash2"));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Issue #123: Configurable risk score thresholds per asset class
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_per_asset_risk_thresholds() {
-    let (env, admin, client) = setup();
-    let asset_type = Symbol::new(&env, "real_estate");
-
-    let thresholds = RiskThresholds {
-        max_risk_score: 6,
-        require_aml_clearance_above: 5,
-    };
-    client.set_risk_thresholds(&admin, &asset_type, &thresholds);
-
-    let stored = client.get_risk_thresholds(&asset_type);
-    assert_eq!(stored.max_risk_score, 6);
-    assert_eq!(stored.require_aml_clearance_above, 5);
-}
-
-#[test]
-fn test_threshold_update() {
-    let (env, admin, client) = setup();
-    let asset_type = Symbol::new(&env, "commodity");
-
-    // Set initial thresholds.
-    client.set_risk_thresholds(
+    // The monthly window was last reset in the middle of January.
+    let mid_january = NEW_YEAR_2026 + 14 * 86_400;
+    env.ledger().set_timestamp(mid_january);
+    client.set_transfer_limits(
         &admin,
-        &asset_type,
-        &RiskThresholds {
-            max_risk_score: 7,
-            require_aml_clearance_above: 7,
-        },
+        &user,
+        &limits(1_000_000, 1_000, 10_000, mid_january),
     );
 
-    // Update to stricter thresholds.
-    client.set_risk_thresholds(
-        &admin,
-        &asset_type,
-        &RiskThresholds {
-            max_risk_score: 4,
-            require_aml_clearance_above: 4,
-        },
-    );
+    assert!(client.check_transfer_limits(&user, &1_000));
+    assert!(!client.check_transfer_limits(&user, &1));
 
-    let stored = client.get_risk_thresholds(&asset_type);
-    assert_eq!(stored.max_risk_score, 4);
-    assert_eq!(stored.require_aml_clearance_above, 4);
+    // 2026-02-01T00:00:00Z — the first day of the next calendar month. A
+    // 30-day window would not have rolled over yet.
+    env.ledger().set_timestamp(FEB_2026);
+    assert!(client.check_transfer_limits(&user, &1_000));
 }
 
 #[test]
-fn test_default_threshold_fallback() {
-    let (env, _admin, client) = setup();
-    let asset_type = Symbol::new(&env, "unconfigured_asset");
-
-    // No thresholds configured — should return the default (8, 8).
-    let stored = client.get_risk_thresholds(&asset_type);
-    assert_eq!(stored.max_risk_score, 8);
-    assert_eq!(stored.require_aml_clearance_above, 8);
-}
-
-#[test]
-fn test_check_compliance_with_asset() {
-    let (env, admin, client) = setup();
-    let asset_type = Symbol::new(&env, "strict_asset");
-    let user_a = Address::generate(&env);
-    let user_b = Address::generate(&env);
-
-    // Give both users valid KYC with a risk score of 6.
-    let mut kyc = verified_kyc(&env);
-    kyc.risk_score = 6;
-    client.update_kyc_status(&admin, &user_a, &kyc);
-    client.update_kyc_status(&admin, &user_b, &kyc);
-
-    // Default threshold (8): risk score 6 should pass.
-    assert!(client.check_compliance(&user_a, &user_b, &100));
-
-    // Set a stricter threshold (max_risk_score = 5) for the asset type.
-    client.set_risk_thresholds(
-        &admin,
-        &asset_type,
-        &RiskThresholds {
-            max_risk_score: 5,
-            require_aml_clearance_above: 5,
-        },
-    );
-
-    // Asset-specific check with the stricter threshold should reject risk 6.
-    assert!(!client.check_compliance_with_asset(&user_a, &user_b, &100, &asset_type));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Issue #124: Compliance data export for regulatory reporting
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_generate_kyc_report() {
+fn annual_limit_resets_on_new_year() {
     let (env, admin, client) = setup();
     let user = Address::generate(&env);
 
-    // Update KYC status — this logs a `kyc_verified` event.
+    env.ledger().set_timestamp(JUN_2026);
+    client.set_transfer_limits(
+        &admin,
+        &user,
+        &limits(1_000_000, 1_000_000, 10_000, JUN_2026),
+    );
+
+    assert!(client.check_transfer_limits(&user, &10_000));
+    assert!(!client.check_transfer_limits(&user, &1));
+
+    // 2027-01-01T00:00:00Z — a 365-day window would not have rolled over yet.
+    env.ledger().set_timestamp(NEW_YEAR_2027);
+    assert!(client.check_transfer_limits(&user, &10_000));
+}
+
+#[test]
+fn limits_written_by_the_previous_implementation_still_work() {
+    // The stored `last_reset_*` values stay timestamps, so a row written
+    // before this change is interpreted rather than rewritten: no migration
+    // is needed.
+    let (env, admin, client) = setup();
+    let user = Address::generate(&env);
+
+    env.ledger().set_timestamp(NEW_YEAR_2026);
+    client.set_transfer_limits(
+        &admin,
+        &user,
+        &limits(1_000, 1_000, 10_000, NEW_YEAR_2026 - 86_400),
+    );
+
+    // The daily window is a day old, so it rolls over; the monthly and
+    // annual windows are still the ones that were stored.
+    assert!(client.check_transfer_limits(&user, &1_000));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issue #111: KYC expiry grace period
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn kyc_state_is_active_while_the_record_is_valid() {
+    let (env, admin, client) = setup();
+    let user = Address::generate(&env);
+
     client.update_kyc_status(&admin, &user, &verified_kyc(&env));
 
-    let now = env.ledger().timestamp();
-    let report = client.generate_report(
-        &Symbol::new(&env, "KYC_VERIFICATIONS"),
-        &(now - 1000),
-        &(now + 1000),
-    );
-
-    assert_eq!(report.report_type, Symbol::new(&env, "KYC_VERIFICATIONS"));
-    assert!(report.entries.len() >= 1);
-    let entry = report.entries.get(0).unwrap();
-    assert_eq!(entry.entry_type, Symbol::new(&env, "kyc_verified"));
-    assert_eq!(entry.address, user);
+    assert_eq!(client.get_effective_kyc_state(&user), KycState::Active);
+    assert!(client.get_kyc_status(&user).is_verified);
 }
 
 #[test]
-fn test_generate_blacklist_report() {
+fn kyc_state_is_warning_inside_the_grace_period() {
     let (env, admin, client) = setup();
     let user = Address::generate(&env);
 
-    // Add to blacklist then remove — both are logged.
+    let mut kyc = verified_kyc(&env);
+    kyc.expiry_date = env.ledger().timestamp() + 3 * 86_400; // three days left
+    client.update_kyc_status(&admin, &user, &kyc);
+
+    assert_eq!(client.get_effective_kyc_state(&user), KycState::Warning);
+    // The record is still verified while it is inside the grace period.
+    assert!(client.get_kyc_status(&user).is_verified);
+}
+
+#[test]
+fn kyc_state_is_expired_after_the_expiry_date() {
+    let (env, admin, client) = setup();
+    let user = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000_000);
+    let mut kyc = verified_kyc(&env);
+    kyc.expiry_date = 999_999; // already expired
+    client.update_kyc_status(&admin, &user, &kyc);
+
+    assert_eq!(client.get_effective_kyc_state(&user), KycState::Expired);
+    // The effective status is reported as no longer verified.
+    assert!(!client.get_kyc_status(&user).is_verified);
+}
+
+#[test]
+fn kyc_state_is_revoked_for_a_blacklisted_address() {
+    let (env, admin, client) = setup();
+    let user = Address::generate(&env);
+
+    client.update_kyc_status(&admin, &user, &verified_kyc(&env));
     client.add_to_blacklist(&admin, &user, &Symbol::new(&env, "fraud"));
-    client.remove_from_blacklist(&admin, &user);
 
-    let now = env.ledger().timestamp();
-    let report = client.generate_report(
-        &Symbol::new(&env, "BLACKLIST_CHANGES"),
-        &(now - 1000),
-        &(now + 1000),
-    );
-
-    assert_eq!(report.entries.len(), 2);
-    let add = report.entries.get(0).unwrap();
-    assert_eq!(add.entry_type, Symbol::new(&env, "blacklisted"));
-    let rem = report.entries.get(1).unwrap();
-    assert_eq!(rem.entry_type, Symbol::new(&env, "unblacklisted"));
+    assert_eq!(client.get_effective_kyc_state(&user), KycState::Revoked);
+    assert!(!client.get_kyc_status(&user).is_verified);
 }
 
 #[test]
-fn test_empty_report() {
-    let (env, _admin, client) = setup();
-    let now = env.ledger().timestamp();
+fn warning_state_halves_the_transfer_limit() {
+    let (env, admin, client) = setup();
+    let user = Address::generate(&env);
 
-    // No events have been logged in this range, so the report should be empty.
-    let report = client.generate_report(
-        &Symbol::new(&env, "KYC_VERIFICATIONS"),
-        &(now - 1000),
-        &(now + 1000),
+    let mut kyc = verified_kyc(&env);
+    kyc.expiry_date = env.ledger().timestamp() + 3 * 86_400;
+    client.update_kyc_status(&admin, &user, &kyc);
+
+    client.set_transfer_limits(
+        &admin,
+        &user,
+        &limits(1_000, 1_000_000, 1_000_000, 0),
     );
 
-    assert_eq!(report.entries.len(), 0);
-}
-
-#[test]
-#[should_panic]
-fn test_date_range_validation() {
-    let (env, _admin, client) = setup();
-    let now = env.ledger().timestamp();
-
-    // Window of 91 days (91 * 86400 seconds) exceeds the 90-day maximum.
-    let too_long: u64 = 91 * 86400;
-    client.generate_report(
-        &Symbol::new(&env, "KYC_VERIFICATIONS"),
-        &now,
-        &(now + too_long),
-    );
+    // A participant inside the grace period may move up to half of their
+    // normal limit.
+    assert!(client.check_transfer_limits(&user, &500));
+    assert!(!client.check_transfer_limits(&user, &1));
 }
