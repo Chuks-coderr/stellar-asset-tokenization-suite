@@ -14,8 +14,9 @@ PR_ISSUE_19.md
 PR_ISSUE_20.md
 PR_ISSUE_21.md
 AGENTS.md
-
-# Test snapshots
-**/snapshots/
+# additional ignores
 *.snap
-test_snapshots/
+**/*.snap
+__snapshots__/
+**/__snapshots__/
+

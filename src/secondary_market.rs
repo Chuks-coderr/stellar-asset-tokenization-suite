@@ -139,6 +139,16 @@ pub struct BookOrder {
     pub created_at: u64,
 }
 
+/// Aggregated order-book depth within a price range (issue #146).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OrderBookDepth {
+    pub best_price: i128,
+    pub total_amount: i128,
+    pub order_count: u32,
+    pub levels: Vec<OrderBookLevel>,
+}
+
 /// Issue #147: parameters of the price-deviation circuit breaker.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -383,7 +393,14 @@ impl SecondaryMarket {
             let base_token = TokenClient::new(&env, &config.base_currency);
             base_token.transfer(&maker, &env.current_contract_address(), &total_cost);
         } else if side == Symbol::new(&env, "sell") {
+            // Issue #145: explicitly verify the maker's balance before escrowing,
+            // so a sell order with insufficient balance fails fast with a clear
+            // error instead of surfacing a token-transfer error mid-escrow.
             let rwa_token = RWATokenClient::new(&env, &token_address);
+            let maker_balance = rwa_token.get_balance(&maker).amount;
+            if maker_balance < amount {
+                panic_with_error!(&env, MarketError::InsufficientBalance);
+            }
             rwa_token.transfer(&maker, &env.current_contract_address(), &amount);
         } else {
             panic_with_error!(&env, MarketError::InvalidOrder);
@@ -773,6 +790,114 @@ impl SecondaryMarket {
         }
 
         // Issue #142: evaluate conditional orders after every trade execution.
+        Self::evaluate_conditional_orders(env.clone(), token_address.clone());
+
+        filled_total
+    }
+
+    /// Execute a TWAP (time-weighted average price) order: split `total_amount`
+    /// into `num_slices` equal slices and fill each slice at the best available
+    /// price within `limit_price`. Slices execute sequentially in a single
+    /// call; in production, an external scheduler would invoke the contract
+    /// once per `interval_seconds` to advance the next slice. Returns the total
+    /// amount filled (issue #144).
+    pub fn place_twap_order(
+        env: Env,
+        taker: Address,
+        token_address: Address,
+        side: Symbol,
+        total_amount: i128,
+        num_slices: u32,
+        _interval_seconds: u64,
+        limit_price: i128,
+    ) -> i128 {
+        taker.require_auth();
+
+        Self::check_version(&env);
+
+        let config: MarketConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketError::MarketNotInitialized));
+        if config.is_paused {
+            panic_with_error!(&env, MarketError::TradingPaused);
+        }
+
+        let is_buy = side == Symbol::new(&env, "buy");
+        let is_sell = side == Symbol::new(&env, "sell");
+        if !is_buy && !is_sell {
+            panic_with_error!(&env, MarketError::InvalidOrder);
+        }
+        if total_amount < config.min_order_size {
+            panic_with_error!(&env, MarketError::MinOrderSizeNotMet);
+        }
+        if num_slices == 0 {
+            panic_with_error!(&env, MarketError::InvalidParameters);
+        }
+        if limit_price <= 0 {
+            panic_with_error!(&env, MarketError::InvalidParameters);
+        }
+
+        Self::check_trading_halt(&env, &config, &token_address);
+        Self::check_compliance(&env, &config, &taker, &token_address);
+
+        Self::validate_order_price(&env, &config, &token_address, limit_price);
+        Self::enforce_circuit_breaker(&env, &token_address, None);
+
+        let resting_is_bid = is_sell;
+        let slice_size = total_amount / num_slices as i128;
+        if slice_size == 0 {
+            panic_with_error!(&env, MarketError::InvalidOrder);
+        }
+
+        let mut remaining = total_amount;
+        let mut filled_total: i128 = 0;
+        let mut slices_left = num_slices;
+
+        while slices_left > 0 && remaining > 0 {
+            let this_slice = if slice_size < remaining { slice_size } else { remaining };
+
+            let best = match Self::best_opposing_order(&env, &token_address, resting_is_bid, &taker) {
+                Some(order) => order,
+                None => break,
+            };
+
+            let within_limit = if is_buy {
+                best.price <= limit_price
+            } else {
+                best.price >= limit_price
+            };
+            if !within_limit {
+                break;
+            }
+
+            let available = best.amount - best.filled_amount;
+            if available <= 0 {
+                break;
+            }
+
+            let fill = if available < this_slice { available } else { this_slice };
+
+            Self::settle_fill(&env, &taker, &mut best.clone(), fill, &config);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "twap_order_filled"),
+                    token_address.clone(),
+                ),
+                (fill, best.price, env.ledger().timestamp()),
+            );
+
+            remaining -= fill;
+            filled_total += fill;
+            slices_left -= 1;
+        }
+
+        if filled_total == 0 {
+            panic_with_error!(&env, MarketError::InsufficientLiquidity);
+        }
+
         Self::evaluate_conditional_orders(env.clone(), token_address.clone());
 
         filled_total
@@ -1457,6 +1582,71 @@ impl SecondaryMarket {
         OrderBook {
             bids: Self::book_levels(&env, &token, true),
             asks: Self::book_levels(&env, &token, false),
+        }
+    }
+
+    /// Aggregated order-book depth for `token` on `side` within `price_range_bps`
+    /// basis points of the best price. For bids, depth accumulates downward from
+    /// the best bid; for asks, upward from the best ask (issue #146).
+    pub fn get_order_book_depth(
+        env: Env,
+        token: Address,
+        side: Symbol,
+        price_range_bps: u64,
+    ) -> OrderBookDepth {
+        let is_bid = side == Symbol::new(&env, "buy");
+        let is_ask = side == Symbol::new(&env, "sell");
+        if !is_bid && !is_ask {
+            panic_with_error!(&env, MarketError::InvalidOrder);
+        }
+
+        let book = Self::get_order_book(env.clone(), token.clone());
+        let levels = if is_bid {
+            book.bids
+        } else {
+            book.asks
+        };
+
+        let best_price = match levels.get(0) {
+            Some(l) => l.price,
+            None => return OrderBookDepth {
+                best_price: 0,
+                total_amount: 0,
+                order_count: 0,
+                levels: Vec::new(&env),
+            },
+        };
+
+        let mut included = Vec::<OrderBookLevel>::new(&env);
+        let mut total_amount: i128 = 0;
+        let mut order_count: u32 = 0;
+
+        for level in levels.iter() {
+            let in_range = if is_bid {
+                // Bids: include prices >= best_price * (1 - range_bps / 10000)
+                let min_price = best_price
+                    .saturating_sub((best_price * price_range_bps as i128) / 10000i128);
+                level.price >= min_price
+            } else {
+                // Asks: include prices <= best_price * (1 + range_bps / 10000)
+                let max_price = best_price
+                    .saturating_add((best_price * price_range_bps as i128) / 10000i128);
+                level.price <= max_price
+            };
+            if in_range {
+                included.push_back(level.clone());
+                total_amount += level.total_amount;
+                order_count += level.order_count;
+            } else {
+                break;
+            }
+        }
+
+        OrderBookDepth {
+            best_price,
+            total_amount,
+            order_count,
+            levels: included,
         }
     }
 

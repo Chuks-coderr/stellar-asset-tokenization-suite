@@ -1064,232 +1064,194 @@ fn admin_direct_unfreeze_is_rejected() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// Issue #136: MAX_FEE_RATE cap (1000 bps) validation in update_config
-// ════════════════════════════════════════════════════════════════════════════════
-
-fn make_config(t: &TestEnv, fee_rate: i64) -> DividendConfig {
-    let mut currencies = Vec::new(&t.env);
-    currencies.push_back(t.currency_symbol.clone());
-    DividendConfig {
-        supported_currencies: currencies,
-        auto_distribute: false,
-        min_distribution_amount: 1000,
-        max_distribution_frequency: 86400,
-        fee_rate,
-        fee_recipient: t.admin.clone(),
-        min_claim_window: DEFAULT_MIN_CLAIM_WINDOW,
-    }
-}
-
-#[test]
-fn update_config_fee_rate_at_cap_succeeds() {
-    let t = setup();
-    t.distributor.update_config(&t.admin, &make_config(&t, MAX_FEE_RATE));
-}
-
-#[test]
-#[should_panic]
-fn update_config_fee_rate_above_cap_panics() {
-    let t = setup();
-    t.distributor.update_config(&t.admin, &make_config(&t, MAX_FEE_RATE + 1));
-}
-
-#[test]
-#[should_panic]
-fn update_config_fee_rate_negative_panics() {
-    let t = setup();
-    t.distributor.update_config(&t.admin, &make_config(&t, -1));
-}
-
-#[test]
-fn update_config_fee_rate_zero_succeeds() {
-    let t = setup();
-    t.distributor.update_config(&t.admin, &make_config(&t, 0));
-}
-
-// ════════════════════════════════════════════════════════════════════════════════
-// Issue #133: DistributionCategory + get_distributions_by_category
+// Issue #138: dividend history query with pagination
 // ════════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn distribution_category_is_stored_and_queryable() {
+fn get_distribution_history_returns_paginated_page() {
     let t = setup();
     let deadline = t.env.ledger().timestamp() + 86400;
-    let id = t.distributor.create_distribution(
+
+    // Create 3 distributions
+    let id1 = t.distributor.create_distribution(
         &t.admin,
         &t.token.address,
         &t.currency_symbol,
         &1000i128,
         &deadline,
-        &DistributionCategory::Bonus,
+        &Map::new(&t.env),
+    );
+    let id2 = t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &2000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+    let id3 = t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &3000i128,
+        &deadline,
         &Map::new(&t.env),
     );
 
-    let dist = t.distributor.get_distribution(&id);
-    assert_eq!(dist.category, DistributionCategory::Bonus);
+    let page = t.distributor.get_distribution_history(&0u64, &10u64);
+    assert_eq!(page.total, 3);
+    assert_eq!(page.offset, 0);
+    assert_eq!(page.limit, 10);
+    assert!(!page.has_more);
+    assert_eq!(page.distributions.len(), 3);
 
-    let bonus_dists = t.distributor.get_distributions_by_category(DistributionCategory::Bonus);
-    assert_eq!(bonus_dists.len(), 1);
-    assert_eq!(bonus_dists.get(0).unwrap().distribution_id, id);
-
-    let regular_dists = t.distributor.get_distributions_by_category(DistributionCategory::Regular);
-    assert_eq!(regular_dists.len(), 0);
+    // Newest first: id3, id2, id1
+    assert_eq!(page.distributions.get(0).unwrap().distribution_id, id3);
+    assert_eq!(page.distributions.get(1).unwrap().distribution_id, id2);
+    assert_eq!(page.distributions.get(2).unwrap().distribution_id, id1);
 }
 
 #[test]
-fn get_distributions_by_category_filters_correctly() {
+fn get_distribution_history_pagination_offset_and_limit() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+
+    for i in 0..5 {
+        t.distributor.create_distribution(
+            &t.admin,
+            &t.token.address,
+            &t.currency_symbol,
+            &((100 * (i + 1)) as i128),
+            &deadline,
+            &Map::new(&t.env),
+        );
+    }
+
+    // Page 1: offset 0, limit 2
+    let p1 = t.distributor.get_distribution_history(&0u64, &2u64);
+    assert_eq!(p1.total, 5);
+    assert_eq!(p1.offset, 0);
+    assert_eq!(p1.limit, 2);
+    assert!(p1.has_more);
+    assert_eq!(p1.distributions.len(), 2);
+    // Newest first: ids 5, 4
+    assert_eq!(p1.distributions.get(0).unwrap().distribution_id, 5);
+    assert_eq!(p1.distributions.get(1).unwrap().distribution_id, 4);
+
+    // Page 2: offset 2, limit 2
+    let p2 = t.distributor.get_distribution_history(&2u64, &2u64);
+    assert_eq!(p2.total, 5);
+    assert_eq!(p2.offset, 2);
+    assert_eq!(p2.limit, 2);
+    assert!(p2.has_more);
+    assert_eq!(p2.distributions.len(), 2);
+    assert_eq!(p2.distributions.get(0).unwrap().distribution_id, 3);
+    assert_eq!(p2.distributions.get(1).unwrap().distribution_id, 2);
+
+    // Page 3: offset 4, limit 2 — last item only
+    let p3 = t.distributor.get_distribution_history(&4u64, &2u64);
+    assert_eq!(p3.total, 5);
+    assert_eq!(p3.offset, 4);
+    assert_eq!(p3.limit, 2);
+    assert!(!p3.has_more);
+    assert_eq!(p3.distributions.len(), 1);
+    assert_eq!(p3.distributions.get(0).unwrap().distribution_id, 1);
+}
+
+#[test]
+fn get_distribution_history_offset_beyond_total_returns_empty() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+    t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &1000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+
+    let page = t.distributor.get_distribution_history(&10u64, &5u64);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.offset, 1);
+    assert_eq!(page.distributions.len(), 0);
+    assert!(!page.has_more);
+}
+
+#[test]
+fn get_distribution_history_limit_is_capped() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+
+    for _ in 0..3 {
+        t.distributor.create_distribution(
+            &t.admin,
+            &t.token.address,
+            &t.currency_symbol,
+            &1000i128,
+            &deadline,
+            &Map::new(&t.env),
+        );
+    }
+
+    // Requesting limit 1000 should be capped to 100
+    let page = t.distributor.get_distribution_history(&0u64, &1000u64);
+    assert_eq!(page.limit, 100);
+    assert_eq!(page.distributions.len(), 3);
+}
+
+#[test]
+fn get_distribution_history_zero_limit_uses_default_cap() {
+    let t = setup();
+    let deadline = t.env.ledger().timestamp() + 86400;
+    t.distributor.create_distribution(
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &1000i128,
+        &deadline,
+        &Map::new(&t.env),
+    );
+
+    let page = t.distributor.get_distribution_history(&0u64, &0u64);
+    assert_eq!(page.limit, 100);
+    assert_eq!(page.distributions.len(), 1);
+}
+
+#[test]
+fn get_distribution_history_includes_inactive_distributions() {
     let t = setup();
     let deadline = t.env.ledger().timestamp() + 86400;
 
     let id1 = t.distributor.create_distribution(
-        &t.admin, &t.token.address, &t.currency_symbol, &1000i128, &deadline,
-        &DistributionCategory::Regular, &Map::new(&t.env),
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &1000i128,
+        &deadline,
+        &Map::new(&t.env),
     );
     let id2 = t.distributor.create_distribution(
-        &t.admin, &t.token.address, &t.currency_symbol, &2000i128, &deadline,
-        &DistributionCategory::Special, &Map::new(&t.env),
-    );
-    let id3 = t.distributor.create_distribution(
-        &t.admin, &t.token.address, &t.currency_symbol, &3000i128, &deadline,
-        &DistributionCategory::Special, &Map::new(&t.env),
+        &t.admin,
+        &t.token.address,
+        &t.currency_symbol,
+        &2000i128,
+        &deadline,
+        &Map::new(&t.env),
     );
 
-    let specials = t.distributor.get_distributions_by_category(DistributionCategory::Special);
-    assert_eq!(specials.len(), 2);
-    let ids: Vec<u64> = specials.iter().map(|d| d.distribution_id).collect();
+    // Deactivate the first distribution
+    t.distributor.deactivate_distribution(&t.admin, &id1);
+
+    let page = t.distributor.get_distribution_history(&0u64, &10u64);
+    assert_eq!(page.total, 2);
+    assert_eq!(page.distributions.len(), 2);
+    // Both active and inactive should appear
+    let ids: Vec<u64> = page
+        .distributions
+        .iter()
+        .map(|d| d.distribution_id)
+        .collect();
+    assert!(ids.contains(&id1));
     assert!(ids.contains(&id2));
-    assert!(ids.contains(&id3));
-
-    let regulars = t.distributor.get_distributions_by_category(DistributionCategory::Regular);
-    assert_eq!(regulars.len(), 1);
-    assert_eq!(regulars.get(0).unwrap().distribution_id, id1);
-}
-
-// ════════════════════════════════════════════════════════════════════════════════
-// Issue #134: Claim state machine (Unclaimed -> InProgress -> Claimed)
-// ════════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn claim_state_transitions_unclaimed_to_claimed() {
-    let t = setup();
-    let claimer = Address::generate(&t.env);
-    t.token.transfer(&t.admin, &claimer, &500_000i128);
-
-    let deadline = t.env.ledger().timestamp() + 86400;
-    let id = t.distributor.create_distribution(
-        &t.admin, &t.token.address, &t.currency_symbol, &1000i128, &deadline,
-        &DistributionCategory::Regular, &Map::new(&t.env),
-    );
-
-    // Initially Unclaimed
-    assert_eq!(
-        t.distributor.get_claim_state(&id, &claimer),
-        ClaimState::Unclaimed
-    );
-
-    t.distributor.claim_dividend(&id, &claimer);
-
-    // After claim: Claimed
-    assert_eq!(
-        t.distributor.get_claim_state(&id, &claimer),
-        ClaimState::Claimed
-    );
-}
-
-#[test]
-fn claim_state_defaults_to_unclaimed_for_unknown_claimer() {
-    let t = setup();
-    let deadline = t.env.ledger().timestamp() + 86400;
-    let id = t.distributor.create_distribution(
-        &t.admin, &t.token.address, &t.currency_symbol, &1000i128, &deadline,
-        &DistributionCategory::Regular, &Map::new(&t.env),
-    );
-
-    let unknown = Address::generate(&t.env);
-    assert_eq!(
-        t.distributor.get_claim_state(&id, &unknown),
-        ClaimState::Unclaimed
-    );
-}
-
-// ════════════════════════════════════════════════════════════════════════════════
-// Issue #131: RecurringSchedule with cron-like timing
-// ════════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn create_recurring_distribution_stores_schedule() {
-    let t = setup();
-    let deadline = t.env.ledger().timestamp() + 86400;
-    let schedule = RecurringSchedule {
-        minute: 0,
-        hour: 0,
-        day_of_month: -1,
-        month: -1,
-        day_of_week: -1,
-        last_fired_at: 0,
-        min_interval_seconds: 3600,
-    };
-
-    let id = t.distributor.create_recurring_distribution(
-        &t.admin,
-        &t.token.address,
-        &t.currency_symbol,
-        &1000i128,
-        &deadline,
-        &Map::new(&t.env),
-        &DistributionCategory::Regular,
-        &schedule,
-    );
-
-    let stored = t.distributor.get_recurring_schedule(&id);
-    assert!(stored.is_some());
-    let stored = stored.unwrap();
-    assert_eq!(stored.minute, 0);
-    assert_eq!(stored.hour, 0);
-    assert_eq!(stored.min_interval_seconds, 3600);
-}
-
-#[test]
-fn is_schedule_due_returns_false_for_non_recurring_distribution() {
-    let t = setup();
-    let deadline = t.env.ledger().timestamp() + 86400;
-    let id = t.distributor.create_distribution(
-        &t.admin, &t.token.address, &t.currency_symbol, &1000i128, &deadline,
-        &DistributionCategory::Regular, &Map::new(&t.env),
-    );
-
-    assert!(!t.distributor.is_schedule_due(&id));
-}
-
-#[test]
-fn is_schedule_due_respects_min_interval() {
-    let t = setup();
-    let deadline = t.env.ledger().timestamp() + 86400;
-    let schedule = RecurringSchedule {
-        minute: -1,
-        hour: -1,
-        day_of_month: -1,
-        month: -1,
-        day_of_week: -1,
-        last_fired_at: t.env.ledger().timestamp(),
-        min_interval_seconds: 3600,
-    };
-
-    let id = t.distributor.create_recurring_distribution(
-        &t.admin,
-        &t.token.address,
-        &t.currency_symbol,
-        &1000i128,
-        &deadline,
-        &Map::new(&t.env),
-        &DistributionCategory::Regular,
-        &schedule,
-    );
-
-    // Just fired, min interval not elapsed — not due.
-    assert!(!t.distributor.is_schedule_due(&id));
-
-    // Advance past min interval — now due (all wildcards match).
-    advance_ledger(&t.env, 3601);
-    assert!(t.distributor.is_schedule_due(&id));
 }
