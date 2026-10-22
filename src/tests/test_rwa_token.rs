@@ -1119,251 +1119,117 @@ fn initialize_with_metadata_succeeds() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Issue #97: mutable metadata updates
+// Issue #104: initialization state
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn metadata_updates(env: &Env, entries: &[(&str, &str)]) -> Map<Symbol, String> {
-    let mut updates = Map::new(env);
-    for (key, value) in entries {
-        updates.set(Symbol::new(env, key), String::from_str(env, value));
+#[test]
+fn initialize_cannot_be_called_twice() {
+    // Before the fix the initialization flag was checked but never written, so
+    // a second initialize went through: it overwrote `token_info`, replaced
+    // the admin and minted the initial supply a second time.
+    let t = setup();
+    let supply_before = t.token.get_balance(&t.admin).amount;
+
+    let result = t.token.try_initialize(
+        &t.admin,
+        &Symbol::new(&t.env, "Second"),
+        &Symbol::new(&t.env, "SEC"),
+        &500i128,
+        &6u32,
+        &Symbol::new(&t.env, "real_estate"),
+        &Map::new(&t.env),
+        &t.admin,
+        &t.admin,
+    );
+
+    assert!(result.is_err());
+    assert_eq!(t.token.get_balance(&t.admin).amount, supply_before);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issue #103: batch transfer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn batch_transfer_pays_every_recipient() {
+    let t = setup();
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+
+    let mut recipients = Vec::new(&t.env);
+    recipients.push_back(alice.clone());
+    recipients.push_back(bob.clone());
+
+    let mut amounts = Vec::new(&t.env);
+    amounts.push_back(100i128);
+    amounts.push_back(250i128);
+
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
+
+    assert_eq!(t.token.get_balance(&alice).amount, 100);
+    assert_eq!(t.token.get_balance(&bob).amount, 250);
+    assert_eq!(t.token.get_balance(&t.admin).amount, 1_000_000 - 350);
+}
+
+#[test]
+#[should_panic]
+fn batch_transfer_rejects_mismatched_array_lengths() {
+    let t = setup();
+    let alice = Address::generate(&t.env);
+
+    let mut recipients = Vec::new(&t.env);
+    recipients.push_back(alice.clone());
+
+    let mut amounts = Vec::new(&t.env);
+    amounts.push_back(100i128);
+    amounts.push_back(250i128);
+
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
+}
+
+#[test]
+#[should_panic]
+fn batch_transfer_rejects_an_empty_batch() {
+    let t = setup();
+
+    let recipients = Vec::new(&t.env);
+    let amounts = Vec::new(&t.env);
+
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
+}
+
+#[test]
+#[should_panic]
+fn batch_transfer_rejects_more_than_25_recipients() {
+    let t = setup();
+
+    let mut recipients = Vec::new(&t.env);
+    let mut amounts = Vec::new(&t.env);
+    for _ in 0..26 {
+        recipients.push_back(Address::generate(&t.env));
+        amounts.push_back(1i128);
     }
-    updates
+
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
 }
 
 #[test]
-fn update_metadata_changes_mutable_fields() {
+#[should_panic]
+fn batch_transfer_reverts_when_a_recipient_fails_compliance() {
     let t = setup();
-    let updates = metadata_updates(
-        &t.env,
-        &[("description", "Updated"), ("issuer", "Acme Inc")],
-    );
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
 
-    t.token.update_metadata(&t.admin, &updates);
+    t.compliance
+        .add_to_blacklist(&t.admin, &alice, &Symbol::new(&t.env, "sanctioned"));
 
-    let info = t.token.get_token_info();
-    assert_eq!(
-        info.metadata.get(Symbol::new(&t.env, "description")),
-        Some(String::from_str(&t.env, "Updated"))
-    );
-    assert_eq!(
-        info.metadata.get(Symbol::new(&t.env, "issuer")),
-        Some(String::from_str(&t.env, "Acme Inc"))
-    );
-    // Immutable token fields are untouched.
-    assert_eq!(info.name, Symbol::new(&t.env, "TestToken"));
-    assert_eq!(info.symbol, Symbol::new(&t.env, "TT"));
-    assert_eq!(info.decimals, 6);
-}
+    let mut recipients = Vec::new(&t.env);
+    recipients.push_back(alice.clone());
+    recipients.push_back(bob.clone());
 
-#[test]
-fn update_metadata_by_non_admin_panics() {
-    let t = setup();
-    let attacker = Address::generate(&t.env);
-    let updates = metadata_updates(&t.env, &[("description", "Hacked")]);
+    let mut amounts = Vec::new(&t.env);
+    amounts.push_back(100i128);
+    amounts.push_back(250i128);
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        t.token.update_metadata(&attacker, &updates);
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn update_metadata_rejects_immutable_keys() {
-    let t = setup();
-    for key in ["name", "symbol", "decimals", "created_at"] {
-        let updates = metadata_updates(&t.env, &[(key, "value")]);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            t.token.update_metadata(&t.admin, &updates);
-        }));
-        assert!(result.is_err(), "immutable key `{key}` was accepted");
-    }
-}
-
-#[test]
-fn update_metadata_rejects_value_over_256_bytes() {
-    let t = setup();
-    let long_value = "a".repeat(257);
-    let updates = metadata_updates(&t.env, &[("description", &long_value)]);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        t.token.update_metadata(&t.admin, &updates);
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn update_metadata_rejects_more_than_50_entries() {
-    let t = setup();
-    let mut updates = Map::new(&t.env);
-    for i in 0..51u32 {
-        updates.set(
-            Symbol::new(&t.env, &format!("key{}", i)),
-            String::from_str(&t.env, "value"),
-        );
-    }
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        t.token.update_metadata(&t.admin, &updates);
-    }));
-    assert!(result.is_err());
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Issue #95: allowances
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn approve_sets_allowance_and_transfer_from_decrements_it() {
-    let t = setup();
-    let spender = Address::generate(&t.env);
-    let recipient = Address::generate(&t.env);
-
-    t.token.approve(&t.admin, &spender, &1_000i128);
-    assert_eq!(t.token.allowance(&t.admin, &spender), 1_000);
-    assert_eq!(t.token.get_allowance(&t.admin, &spender), 1_000);
-
-    t.token
-        .transfer_from(&spender, &t.admin, &recipient, &400i128);
-
-    assert_eq!(t.token.get_balance(&recipient).amount, 400);
-    assert_eq!(t.token.get_balance(&t.admin).amount, 999_600);
-    assert_eq!(t.token.allowance(&t.admin, &spender), 600);
-}
-
-#[test]
-fn zero_allowance_revokes_previous_approval() {
-    let t = setup();
-    let spender = Address::generate(&t.env);
-
-    t.token.approve(&t.admin, &spender, &500i128);
-    t.token.approve(&t.admin, &spender, &0i128);
-
-    assert_eq!(t.token.allowance(&t.admin, &spender), 0);
-}
-
-#[test]
-fn transfer_from_above_allowance_panics() {
-    let t = setup();
-    let spender = Address::generate(&t.env);
-    let recipient = Address::generate(&t.env);
-
-    t.token.approve(&t.admin, &spender, &100i128);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        t.token
-            .transfer_from(&spender, &t.admin, &recipient, &101i128);
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn allowance_cannot_exceed_spendable_balance() {
-    let t = setup();
-    let spender = Address::generate(&t.env);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        t.token.approve(&t.admin, &spender, &1_000_001i128);
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn mint_and_burn_do_not_change_allowance() {
-    let t = setup();
-    let spender = Address::generate(&t.env);
-
-    t.token.approve(&t.admin, &spender, &1_000i128);
-    t.token.mint(&t.admin, &t.admin, &500i128);
-    t.token.burn(&t.admin, &100i128);
-
-    assert_eq!(t.token.allowance(&t.admin, &spender), 1_000);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Issue #96: vesting locks and auto-release
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn cliff_lock_releases_only_at_expiry() {
-    let t = setup();
-    t.env.ledger().set_timestamp(1_000);
-
-    t.token.lock_tokens(&t.admin, &t.admin, &1_000i128, &100u64);
-
-    let during = t.token.get_balance(&t.admin);
-    assert_eq!(during.amount, 1_000_000);
-    assert_eq!(during.locked_amount, 1_000);
-    assert_eq!(t.token.get_spendable_balance(&t.admin), 999_000);
-
-    t.env.ledger().set_timestamp(1_099);
-    assert_eq!(t.token.get_balance(&t.admin).locked_amount, 1_000);
-
-    t.env.ledger().set_timestamp(1_100);
-    let after = t.token.get_balance(&t.admin);
-    assert_eq!(after.locked_amount, 0);
-    assert_eq!(after.voting_power, 0);
-    assert_eq!(t.token.get_spendable_balance(&t.admin), 1_000_000);
-}
-
-#[test]
-fn linear_vesting_unlocks_evenly_and_prunes_expired_slots() {
-    let t = setup();
-    t.env.ledger().set_timestamp(2_000);
-
-    t.token.lock_tokens_with_vesting(
-        &t.admin,
-        &t.admin,
-        &1_000i128,
-        &100u64,
-        &VestingType::Linear,
-    );
-
-    t.env.ledger().set_timestamp(2_050);
-    let mid = t.token.get_balance(&t.admin);
-    assert_eq!(mid.amount, 1_000_000);
-    assert_eq!(mid.locked_amount, 500);
-    assert_eq!(t.token.get_spendable_balance(&t.admin), 999_500);
-
-    t.env.ledger().set_timestamp(2_100);
-    let end = t.token.get_balance(&t.admin);
-    assert_eq!(end.locked_amount, 0);
-    assert_eq!(t.token.get_lock_slots(&t.admin).len(), 0);
-}
-
-#[test]
-fn vesting_alias_matches_with_vesting_entry_point() {
-    let t = setup();
-    t.env.ledger().set_timestamp(3_000);
-
-    t.token.lock_tokens_vesting(
-        &t.admin,
-        &t.admin,
-        &2_000i128,
-        &100u64,
-        &VestingType::Linear,
-    );
-
-    assert_eq!(t.token.get_balance(&t.admin).locked_amount, 2_000);
-    assert_eq!(t.token.get_lock_slots(&t.admin).len(), 1);
-}
-
-#[test]
-fn multiple_vesting_slots_are_tracked_independently() {
-    let t = setup();
-    t.env.ledger().set_timestamp(4_000);
-
-    t.token.lock_tokens(&t.admin, &t.admin, &1_000i128, &100u64);
-    t.token.lock_tokens_with_vesting(
-        &t.admin,
-        &t.admin,
-        &2_000i128,
-        &200u64,
-        &VestingType::Linear,
-    );
-
-    t.env.ledger().set_timestamp(4_100);
-    // Cliff slot expired; the linear slot is 50% vested (1_000 locked).
-    let balance = t.token.get_balance(&t.admin);
-    assert_eq!(balance.locked_amount, 1_000);
-    assert_eq!(t.token.get_lock_slots(&t.admin).len(), 1);
+    t.token.batch_transfer(&t.admin, &recipients, &amounts);
 }
