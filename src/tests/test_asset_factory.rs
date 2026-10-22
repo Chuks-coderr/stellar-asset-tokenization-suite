@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use soroban_sdk::{
+    testutils::storage::{Instance as _, Persistent as _},
     testutils::Address as _,
     Address, BytesN, Env, Map, String, Symbol, Vec,
 };
@@ -127,9 +128,9 @@ fn update_admin_changes_admin() {
     let new_admin = Address::generate(&env);
     client.update_admin(&admin, &new_admin);
     // Old admin should no longer be able to call admin-only functions
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.update_admin(&admin, &admin);
-    });
+    }));
     assert!(result.is_err());
 }
 
