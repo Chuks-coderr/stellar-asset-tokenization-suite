@@ -4,6 +4,7 @@ use soroban_sdk::{
 };
 
 use crate::rwa_token::RWATokenClient;
+use crate::secondary_market::SecondaryMarketClient;
 
 const STORAGE_VERSION: u32 = 1;
 
@@ -48,9 +49,9 @@ pub enum DividendError {
     // Issue #139: emergency freeze errors.
     DistributionsFrozen = 23,
     InvalidGovernanceProposal = 24,
-    // Issue #136: fee rate cap errors.
-    FeeRateTooHigh = 25,
-    FeeRateNegative = 26,
+    // Issue #125: dividend reinvestment errors.
+    MarketNotConfigured = 25,
+    ReinvestmentFailed = 26,
 }
 
 #[contracttype]
@@ -594,19 +595,70 @@ impl DividendDistributor {
             Self::get_currency_token_address(env.clone(), dist_currency.clone());
         let currency_client = TokenClient::new(&env, &currency_token_address);
 
-        // Issue #134: lock claim as InProgress before transferring funds.
-        env.storage()
-            .instance()
-            .set(&ck, &ClaimState::InProgress);
+        // Issue #125: If the claimer has opted in to dividend reinvestment,
+        // attempt to auto-purchase RWA tokens at the current VWAP instead of
+        // paying out in currency. Falls back to a normal currency payout when
+        // no market is configured, VWAP is zero (no liquidity), or the
+        // computed token amount is zero.
+        let token_address = distribution.token_address.clone();
+        let reinvesting = Self::is_reinvesting(env.clone(), claimer.clone(), token_address.clone());
+        let mut reinvested = false;
 
-        currency_client.transfer(&env.current_contract_address(), &claimer, &net_amount);
+        if reinvesting {
+            let market_addr: Option<Address> = env
+                .storage()
+                .instance()
+                .get(&Symbol::new(&env, "market_addr"));
 
-        if fee_amount > 0 {
-            currency_client.transfer(
-                &env.current_contract_address(),
-                &config.fee_recipient,
-                &fee_amount,
-            );
+            if let Some(market_addr) = market_addr {
+                let market_client = SecondaryMarketClient::new(&env, &market_addr);
+                let vwap = market_client.get_vwap(&token_address);
+
+                if vwap > 0 {
+                    let tokens_bought = net_amount / vwap;
+                    if tokens_bought > 0 {
+                        // Use the dividend currency to pay for the token
+                        // purchase (currency stays with the contract) and mint
+                        // new RWA tokens to the claimer.
+                        let rwa_client = RWATokenClient::new(&env, &token_address);
+                        rwa_client.mint(&env.current_contract_address(), &claimer, &tokens_bought);
+
+                        // Pay the fee in currency as usual.
+                        if fee_amount > 0 {
+                            currency_client.transfer(
+                                &env.current_contract_address(),
+                                &config.fee_recipient,
+                                &fee_amount,
+                            );
+                        }
+
+                        env.events().publish(
+                            (
+                                Symbol::new(&env, "reinvestment_executed"),
+                                claimer.clone(),
+                                token_address.clone(),
+                            ),
+                            (distribution_id, tokens_bought, net_amount, vwap, current_time),
+                        );
+
+                        reinvested = true;
+                    }
+                }
+            }
+        }
+
+        if !reinvested {
+            // Normal currency payout (also the fallback when reinvestment is
+            // not possible — no market, no liquidity, or zero tokens).
+            currency_client.transfer(&env.current_contract_address(), &claimer, &net_amount);
+
+            if fee_amount > 0 {
+                currency_client.transfer(
+                    &env.current_contract_address(),
+                    &config.fee_recipient,
+                    &fee_amount,
+                );
+            }
         }
 
         let claim_info = ClaimInfo {
@@ -1453,5 +1505,74 @@ impl DividendDistributor {
 
         map.get(currency)
             .unwrap_or_else(|| { panic_with_error!(&env, DividendError::UnsupportedCurrency); })
+    }
+
+    // ── Issue #125: dividend reinvestment ─────────────────────────────────
+
+    /// Storage key for a user's reinvestment opt-in. Uses a composite key of
+    /// (fixed symbol, user address, token address) so each (user, token)
+    /// pair is tracked independently.
+    fn reinvest_key(env: &Env, user: &Address, token: &Address) -> (Symbol, Address, Address) {
+        (Symbol::new(env, "reinvest"), user.clone(), token.clone())
+    }
+
+    /// Opt in to automatic dividend reinvestment for `token_address`. The
+    /// caller (user) must authorise this transaction. When opted in, future
+    /// `claim_dividend` calls will auto-purchase RWA tokens at the current
+    /// VWAP instead of paying out in currency.
+    pub fn opt_in_reinvestment(env: Env, user: Address, token_address: Address) {
+        user.require_auth();
+
+        let key = Self::reinvest_key(&env, &user, &token_address);
+        env.storage().instance().set(&key, &true);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "reinvestment_opted_in"),
+                user,
+                token_address,
+            ),
+            (env.ledger().timestamp(),),
+        );
+    }
+
+    /// Opt out of dividend reinvestment for `token_address`. Future claims
+    /// will pay out in currency as normal.
+    pub fn opt_out_reinvestment(env: Env, user: Address, token_address: Address) {
+        user.require_auth();
+
+        let key = Self::reinvest_key(&env, &user, &token_address);
+        env.storage().instance().set(&key, &false);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "reinvestment_opted_out"),
+                user,
+                token_address,
+            ),
+            (env.ledger().timestamp(),),
+        );
+    }
+
+    /// Whether `address` has opted in to dividend reinvestment for `token`.
+    pub fn is_reinvesting(env: Env, address: Address, token: Address) -> bool {
+        let key = Self::reinvest_key(&env, &address, &token);
+        env.storage().instance().get(&key).unwrap_or(false)
+    }
+
+    /// Configure the secondary market address used to look up VWAP prices for
+    /// dividend reinvestment. Admin-only.
+    pub fn set_market_address(env: Env, auth: Address, market_address: Address) {
+        crate::shared_admin::require_admin(&env, &auth);
+        Self::check_version(&env);
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "market_addr"), &market_address);
+
+        env.events().publish(
+            (Symbol::new(&env, "market_address_set"), auth),
+            (market_address, env.ledger().timestamp()),
+        );
     }
 }
