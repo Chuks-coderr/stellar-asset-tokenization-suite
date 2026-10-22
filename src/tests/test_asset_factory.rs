@@ -7,8 +7,8 @@ use soroban_sdk::{
 };
 
 use crate::asset_factory::{
-    AssetClass, AssetConfig, AssetFactory, AssetFactoryClient, AssetFactoryError,
-    ComplianceRules, AssetTemplate,
+    AssetClass, AssetConfig, AssetFactory, AssetFactoryClient, AssetFactoryError, AssetTemplate,
+    ComplianceRules,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -271,4 +271,70 @@ fn data_integrity_after_migration_cycle() {
     // Template data intact
     let commodity_tmpl = client.get_template(&AssetClass::Commodity);
     assert!(commodity_tmpl.is_active);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issue #94: consistent contract storage types with TTL extension
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn setup_with_id() -> (Env, Address, Address, AssetFactoryClient<'static>) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, AssetFactory);
+    let client = AssetFactoryClient::new(&env, &contract_id);
+    client.initialize(&admin, &admin);
+    let client: AssetFactoryClient<'static> = unsafe { core::mem::transmute(client) };
+    (env, admin, contract_id, client)
+}
+
+#[test]
+fn registry_uses_persistent_storage_with_extended_ttl() {
+    let (env, _admin, contract_id, client) = setup_with_id();
+
+    env.as_contract(&contract_id, || {
+        let registry_key = Symbol::new(&env, "registry");
+        assert!(env.storage().persistent().has(&registry_key));
+        assert!(!env.storage().instance().has(&registry_key));
+        assert!(env.storage().persistent().get_ttl(&registry_key) > 0);
+    });
+
+    // Reading the registry refreshes its TTL.
+    assert_eq!(client.get_all_assets().len(), 0);
+
+    env.as_contract(&contract_id, || {
+        let registry_key = Symbol::new(&env, "registry");
+        assert!(env.storage().persistent().get_ttl(&registry_key) > 0);
+    });
+}
+
+#[test]
+fn admin_counters_and_templates_stay_in_instance_storage() {
+    let (env, admin, contract_id, client) = setup_with_id();
+
+    let template = AssetTemplate {
+        asset_class: AssetClass::RealEstate,
+        base_config: default_asset_config(&env),
+        wasm_hash: BytesN::from_array(&env, &[0u8; 32]),
+        is_active: true,
+        version: 1,
+    };
+    client.register_template(&admin, &template);
+
+    env.as_contract(&contract_id, || {
+        assert!(env.storage().instance().has(&Symbol::new(&env, "admin")));
+        assert!(env
+            .storage()
+            .instance()
+            .has(&Symbol::new(&env, "asset_count")));
+        assert!(env
+            .storage()
+            .instance()
+            .has(&Symbol::new(&env, "templates")));
+        assert!(env.storage().instance().get_ttl() > 0);
+    });
+
+    // Templates and counters remain readable through their instance entries.
+    assert_eq!(client.get_asset_count(), 0);
+    assert_eq!(client.get_template(&AssetClass::RealEstate).version, 1);
 }

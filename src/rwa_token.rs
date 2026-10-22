@@ -1,6 +1,6 @@
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Map, String,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Map,
+    String, Symbol, Vec,
 };
 
 use crate::compliance_registry::ComplianceRegistryClient;
@@ -165,12 +165,10 @@ impl RWAToken {
         env.storage()
             .instance()
             .set(&locks_key(&env), &Map::<Address, Vec<LockSlot>>::new(&env));
-        env.storage()
-            .instance()
-            .set(
-                &allowances_key(&env),
-                &Map::<(Address, Address), i128>::new(&env),
-            );
+        env.storage().instance().set(
+            &allowances_key(&env),
+            &Map::<(Address, Address), i128>::new(&env),
+        );
         env.storage().instance().set(&initialized_key(&env), &true);
 
         // The initializing `auth` becomes this token's admin: `mint` (which
@@ -307,9 +305,7 @@ impl RWAToken {
         let now = env.ledger().timestamp();
 
         let mut locks = Self::read_locks(env);
-        let slots = locks
-            .get(address.clone())
-            .unwrap_or_else(|| Vec::new(env));
+        let slots = locks.get(address.clone()).unwrap_or_else(|| Vec::new(env));
 
         let mut active = Vec::new(env);
         let mut total_locked: i128 = 0;
@@ -434,12 +430,7 @@ impl RWAToken {
             panic_with_error!(env, RWATokenError::TransferPaused);
         }
 
-        if !Self::check_transfer_compliance(
-            env.clone(),
-            from.clone(),
-            to.clone(),
-            amount,
-        ) {
+        if !Self::check_transfer_compliance(env.clone(), from.clone(), to.clone(), amount) {
             panic_with_error!(env, RWATokenError::ComplianceCheckFailed);
         }
 
@@ -447,7 +438,9 @@ impl RWAToken {
         let mut to_balance = Self::refresh_balance(env, to);
 
         // Only spendable (unlocked) tokens may be transferred.
-        let spendable = from_balance.amount.saturating_sub(from_balance.locked_amount);
+        let spendable = from_balance
+            .amount
+            .saturating_sub(from_balance.locked_amount);
         if spendable < amount {
             panic_with_error!(env, RWATokenError::InsufficientBalance);
         }
@@ -554,13 +547,7 @@ impl RWAToken {
     }
 
     /// Transfers `amount` from `from` to `to` using `spender`'s allowance.
-    pub fn transfer_from(
-        env: Env,
-        spender: Address,
-        from: Address,
-        to: Address,
-        amount: i128,
-    ) {
+    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
 
         if amount <= 0 {
@@ -616,14 +603,7 @@ impl RWAToken {
     /// Locks tokens until `lock_period` seconds have elapsed. Legacy entry
     /// point; equivalent to a cliff vesting schedule.
     pub fn lock_tokens(env: Env, auth: Address, owner: Address, amount: i128, lock_period: u64) {
-        Self::lock_tokens_with_vesting(
-            env,
-            auth,
-            owner,
-            amount,
-            lock_period,
-            VestingType::Cliff,
-        );
+        Self::lock_tokens_with_vesting(env, auth, owner, amount, lock_period, VestingType::Cliff);
     }
 
     /// Locks tokens with an explicit vesting schedule.
@@ -661,9 +641,7 @@ impl RWAToken {
             .unwrap_or_else(|| panic_with_error!(&env, RWATokenError::Overflow));
 
         let mut locks = Self::read_locks(&env);
-        let mut slots = locks
-            .get(owner.clone())
-            .unwrap_or_else(|| Vec::new(&env));
+        let mut slots = locks.get(owner.clone()).unwrap_or_else(|| Vec::new(&env));
         slots.push_back(LockSlot {
             amount,
             until,
@@ -716,9 +694,7 @@ impl RWAToken {
 
         let now = env.ledger().timestamp();
         let mut locks = Self::read_locks(&env);
-        let slots = locks
-            .get(owner.clone())
-            .unwrap_or_else(|| Vec::new(&env));
+        let slots = locks.get(owner.clone()).unwrap_or_else(|| Vec::new(&env));
 
         let mut remaining = amount;
         let mut kept = Vec::new(&env);
@@ -747,10 +723,8 @@ impl RWAToken {
                     slot.amount = if remaining_duration == 0 || duration == 0 {
                         new_locked as i128
                     } else {
-                        (new_locked
-                            .checked_mul(duration)
-                            .unwrap_or(u128::MAX)
-                            / remaining_duration) as i128
+                        (new_locked.checked_mul(duration).unwrap_or(u128::MAX) / remaining_duration)
+                            as i128
                     };
                     if slot.amount > currently_locked {
                         slot.amount = currently_locked - take;
@@ -803,10 +777,7 @@ impl RWAToken {
         let created_at_key = Symbol::new(&env, "created_at");
 
         for (key, value) in updates.iter() {
-            if key == name_key
-                || key == symbol_key
-                || key == decimals_key
-                || key == created_at_key
+            if key == name_key || key == symbol_key || key == decimals_key || key == created_at_key
             {
                 panic_with_error!(&env, RWATokenError::MetadataKeyImmutable);
             }
@@ -834,10 +805,8 @@ impl RWAToken {
             .instance()
             .set(&Symbol::new(&env, "token_info"), &token_info);
 
-        env.events().publish(
-            (Symbol::new(&env, "metadata_updated"), auth),
-            changed,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "metadata_updated"), auth), changed);
     }
 
     // ── delegated voting (liquid democracy) ───────────────────────────────────

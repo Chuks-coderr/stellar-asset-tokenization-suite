@@ -13,9 +13,7 @@ use stellar_asset_tokenization_suite::asset_factory::{
 use stellar_asset_tokenization_suite::compliance_registry::{
     ComplianceRegistry, ComplianceRegistryClient,
 };
-use stellar_asset_tokenization_suite::rwa_token::{
-    RWAToken, RWATokenClient, VestingType,
-};
+use stellar_asset_tokenization_suite::rwa_token::{RWAToken, RWATokenClient, VestingType};
 
 struct TokenFixture {
     env: Env,
@@ -55,10 +53,7 @@ fn token_fixture() -> TokenFixture {
 fn metadata_updates(env: &Env, entries: &[(&str, &str)]) -> Map<Symbol, String> {
     let mut updates = Map::new(env);
     for (key, value) in entries {
-        updates.set(
-            Symbol::new(env, key),
-            String::from_str(env, value),
-        );
+        updates.set(Symbol::new(env, key), String::from_str(env, value));
     }
     updates
 }
@@ -70,7 +65,10 @@ fn update_metadata_changes_only_mutable_fields() {
     let f = token_fixture();
     let updates = metadata_updates(
         &f.env,
-        &[("description", "Updated description"), ("issuer", "Acme Inc")],
+        &[
+            ("description", "Updated description"),
+            ("issuer", "Acme Inc"),
+        ],
     );
 
     f.token.update_metadata(&f.admin, &updates);
@@ -136,7 +134,8 @@ fn approve_and_transfer_from_respects_and_decrements_allowance() {
     f.token.approve(&f.admin, &spender, &1_000i128);
     assert_eq!(f.token.allowance(&f.admin, &spender), 1_000);
 
-    f.token.transfer_from(&spender, &f.admin, &recipient, &400i128);
+    f.token
+        .transfer_from(&spender, &f.admin, &recipient, &400i128);
 
     assert_eq!(f.token.get_balance(&recipient).amount, 400);
     assert_eq!(f.token.allowance(&f.admin, &spender), 600);
@@ -160,7 +159,8 @@ fn transfer_from_without_allowance_panics() {
     let spender = Address::generate(&f.env);
     let recipient = Address::generate(&f.env);
 
-    f.token.transfer_from(&spender, &f.admin, &recipient, &1i128);
+    f.token
+        .transfer_from(&spender, &f.admin, &recipient, &1i128);
 }
 
 #[test]

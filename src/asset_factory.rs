@@ -1,7 +1,7 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env, Map,
-    String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
+    Map, String, Symbol, Vec,
 };
 
 use crate::auth::assert_admin;
@@ -141,9 +141,10 @@ impl AssetFactory {
         crate::shared_admin::write_admin(&env, &auth, &admin);
 
         env.storage().instance().set(&asset_count_key(&env), &0u32);
-        env.storage()
-            .instance()
-            .set(&templates_key(&env), &Map::<AssetClass, AssetTemplate>::new(&env));
+        env.storage().instance().set(
+            &templates_key(&env),
+            &Map::<AssetClass, AssetTemplate>::new(&env),
+        );
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "version"), &STORAGE_VERSION);
@@ -154,10 +155,8 @@ impl AssetFactory {
         Self::write_registry(&env, &Map::<Symbol, AssetInfo>::new(&env));
         Self::extend_instance_ttl(&env);
 
-        env.events().publish(
-            (Symbol::new(&env, "factory_initialized"), auth),
-            admin,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "factory_initialized"), auth), admin);
     }
 
     // ── storage helpers ───────────────────────────────────────────────────────
@@ -189,9 +188,11 @@ impl AssetFactory {
 
         // Every read refreshes the persistent entry's TTL.
         if env.storage().persistent().has(&key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_EXTEND,
+            );
         }
 
         registry
@@ -200,9 +201,11 @@ impl AssetFactory {
     fn write_registry(env: &Env, registry: &Map<Symbol, AssetInfo>) {
         let key = registry_key(env);
         env.storage().persistent().set(&key, registry);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND,
+        );
     }
 
     fn read_templates(env: &Env) -> Map<AssetClass, AssetTemplate> {
@@ -235,6 +238,7 @@ impl AssetFactory {
     }
 
     fn read_version(env: &Env) -> u32 {
+        Self::extend_instance_ttl(env);
         env.storage()
             .instance()
             .get(&Symbol::new(env, "version"))
@@ -268,9 +272,11 @@ impl AssetFactory {
                     .get::<Symbol, Map<Symbol, AssetInfo>>(&key)
                 {
                     env.storage().persistent().set(&key, &registry);
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+                    env.storage().persistent().extend_ttl(
+                        &key,
+                        PERSISTENT_TTL_THRESHOLD,
+                        PERSISTENT_TTL_EXTEND,
+                    );
                 } else {
                     Self::write_registry(&env, &Map::new(&env));
                 }
@@ -344,13 +350,10 @@ impl AssetFactory {
         // Deploy token with deterministic address using salt
         let salt = env.crypto().sha256(&symbol.clone().to_xdr(&env));
 
-        let token_address = env
-            .deployer()
-            .with_current_contract(salt)
-            .deploy_v2(
-                template.wasm_hash,
-                soroban_sdk::Vec::<soroban_sdk::Val>::new(&env),
-            );
+        let token_address = env.deployer().with_current_contract(salt).deploy_v2(
+            template.wasm_hash,
+            soroban_sdk::Vec::<soroban_sdk::Val>::new(&env),
+        );
 
         // Initialize token
         let token_client = RWATokenClient::new(&env, &token_address);
@@ -482,7 +485,11 @@ impl AssetFactory {
         Self::write_registry(&env, &registry);
 
         env.events().publish(
-            (Symbol::new(&env, "asset_pause_status_changed"), symbol, auth),
+            (
+                Symbol::new(&env, "asset_pause_status_changed"),
+                symbol,
+                auth,
+            ),
             paused,
         );
     }
@@ -554,13 +561,10 @@ impl AssetFactory {
         // Deploy new contract version
         let salt = env.crypto().sha256(&symbol.clone().to_xdr(&env));
 
-        let new_token_address = env
-            .deployer()
-            .with_current_contract(salt)
-            .deploy_v2(
-                new_wasm_hash,
-                soroban_sdk::Vec::<soroban_sdk::Val>::new(&env),
-            );
+        let new_token_address = env.deployer().with_current_contract(salt).deploy_v2(
+            new_wasm_hash,
+            soroban_sdk::Vec::<soroban_sdk::Val>::new(&env),
+        );
 
         // Update asset info
         asset_info.token_address = new_token_address.clone();
@@ -599,10 +603,8 @@ impl AssetFactory {
         Self::write_registry(&env, &updated_registry);
 
         let count: u32 = registry.len();
-        env.events().publish(
-            (Symbol::new(&env, "emergency_pause_all"), auth),
-            count,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "emergency_pause_all"), auth), count);
     }
 
     /// Get all assets from registry
