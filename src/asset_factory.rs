@@ -19,6 +19,18 @@ const INSTANCE_TTL_EXTEND: u32 = 17_280 * 30;
 const PERSISTENT_TTL_THRESHOLD: u32 = 17_280 * 30;
 const PERSISTENT_TTL_EXTEND: u32 = 17_280 * 90;
 
+/// Maximum number of metadata entries an asset may carry (Issue #82).
+const MAX_METADATA_ENTRIES: u32 = 50;
+
+/// Maximum length, in bytes, of a metadata value (Issue #82).
+const MAX_METADATA_VALUE_LEN: u32 = 256;
+
+/// Default number of assets returned by `query_assets` (Issue #83).
+const DEFAULT_QUERY_PAGE_SIZE: u32 = 20;
+
+/// Maximum number of assets `query_assets` returns in one page (Issue #83).
+const MAX_QUERY_PAGE_SIZE: u32 = 100;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum AssetFactoryError {
@@ -110,20 +122,47 @@ pub struct AssetInfo {
     pub upgrade_proposals: Vec<Address>,
 }
 
-fn registry_key(env: &Env) -> Symbol {
-    Symbol::new(env, "registry")
+/// The filters applied by `query_assets` (Issue #83).
+///
+/// A filter that is not switched on is not applied, so one struct covers
+/// "no filter" and "filter by class" without optional parameters.
+#[contracttype]
+#[derive(Clone)]
+pub struct AssetQueryFilter {
+    /// Only return assets of this class, when `by_class` is set.
+    pub asset_class: AssetClass,
+    /// Whether the asset class filter applies.
+    pub by_class: bool,
+    /// Only return assets in this pause state, when `by_pause_state` is set.
+    pub is_paused: bool,
+    /// Whether the pause state filter applies.
+    pub by_pause_state: bool,
+    /// Only return assets created at or after this timestamp, when
+    /// `by_created_at` is set.
+    pub created_after: u64,
+    /// Only return assets created at or before this timestamp, when
+    /// `by_created_at` is set.
+    pub created_before: u64,
+    /// Whether the created-at window applies.
+    pub by_created_at: bool,
+    /// Resume the query after the asset with this symbol, when `has_cursor`
+    /// is set. The registry is keyed by symbol, so the order is stable.
+    pub cursor: Symbol,
+    /// Whether the cursor applies.
+    pub has_cursor: bool,
 }
 
-fn templates_key(env: &Env) -> Symbol {
-    Symbol::new(env, "templates")
-}
-
-fn admin_key(env: &Env) -> Symbol {
-    Symbol::new(env, "admin")
-}
-
-fn asset_count_key(env: &Env) -> Symbol {
-    Symbol::new(env, "asset_count")
+/// A page of assets returned by `query_assets` (Issue #83).
+#[contracttype]
+#[derive(Clone)]
+pub struct AssetQueryPage {
+    /// The assets on this page.
+    pub assets: Vec<AssetInfo>,
+    /// The symbol to pass back as the cursor to fetch the next page: the
+    /// symbol of the last asset of this page.
+    pub next_cursor: Symbol,
+    /// Whether another page follows this one.
+    pub has_more: bool,
 }
 
 #[contract]
@@ -304,6 +343,10 @@ impl AssetFactory {
             panic_with_error!(&env, AssetFactoryError::InvalidParameters);
         }
 
+        // Issue #82 — bound the metadata so a single asset cannot bloat the
+        // contract's storage.
+        validate_metadata(&env, &config.metadata);
+
         // Validate compliance rules
         if config.compliance_rules.transfer_limits < 0 {
             panic_with_error!(&env, AssetFactoryError::InvalidParameters);
@@ -400,7 +443,16 @@ impl AssetFactory {
             panic_with_error!(&env, AssetFactoryError::InvalidParameters);
         }
 
-        let admin = Self::read_admin(&env);
+        // Issue #82 — bound the metadata so a single asset cannot bloat the
+        // contract's storage.
+        validate_metadata(&env, &spec.metadata);
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "admin"))
+            .unwrap_or_else(|| { panic_with_error!(&env, AssetFactoryError::NotInitialized); });
+
         assert_admin(&env, &auth, &admin);
 
         Self::check_version(&env);
@@ -466,6 +518,88 @@ impl AssetFactory {
             result.push_back(asset_info);
         }
         result
+    }
+
+    /// Query the registry with filters and cursor-based pagination
+    /// (Issue #83).
+    ///
+    /// The registry is keyed by symbol, so the iteration order is stable.
+    /// `filter.cursor` is the symbol of the last asset of the previous page
+    /// and the query resumes after it; `filter.has_cursor` says whether the
+    /// cursor applies at all (the first page is fetched with it off).
+    ///
+    /// `limit` is the page size: `0` means the default of 20, and anything
+    /// above 100 is capped at 100.
+    pub fn query_assets(env: Env, filter: AssetQueryFilter, limit: u32) -> AssetQueryPage {
+        let page_size = if limit == 0 {
+            DEFAULT_QUERY_PAGE_SIZE
+        } else if limit > MAX_QUERY_PAGE_SIZE {
+            MAX_QUERY_PAGE_SIZE
+        } else {
+            limit
+        };
+
+        let registry: Map<Symbol, AssetInfo> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "registry"))
+            .unwrap_or(Map::new(&env));
+
+        let mut assets: Vec<AssetInfo> = Vec::new(&env);
+        let mut next_cursor: Symbol = filter.cursor.clone();
+        let mut has_more = false;
+        let mut skipping = filter.has_cursor;
+
+        for (symbol, asset_info) in registry.iter() {
+            if skipping {
+                // Resume after the cursor. Comparing the symbols rather than
+                // looking the cursor up keeps the page correct even when the
+                // asset the cursor points at is gone.
+                if symbol > filter.cursor {
+                    skipping = false;
+                } else {
+                    continue;
+                }
+            }
+
+            if !Self::matches_filters(&asset_info, &filter) {
+                continue;
+            }
+
+            if assets.len() >= page_size {
+                // The page is full and another asset matches, so there is a
+                // next page and the cursor is the last symbol of this one.
+                has_more = true;
+                break;
+            }
+
+            assets.push_back(asset_info);
+            next_cursor = symbol.clone();
+        }
+
+        AssetQueryPage { assets, next_cursor, has_more }
+    }
+
+    /// Whether `asset` passes the filters of `filter` (Issue #83).
+    fn matches_filters(asset: &AssetInfo, filter: &AssetQueryFilter) -> bool {
+        if filter.by_class && asset.asset_class != filter.asset_class.clone() {
+            return false;
+        }
+
+        if filter.by_pause_state && asset.is_paused != filter.is_paused {
+            return false;
+        }
+
+        if filter.by_created_at {
+            if asset.created_at < filter.created_after {
+                return false;
+            }
+            if asset.created_at > filter.created_before {
+                return false;
+            }
+        }
+
+        true
     }
 
     pub fn set_asset_pause_status(env: Env, auth: Address, symbol: Symbol, paused: bool) {
@@ -615,6 +749,27 @@ impl AssetFactory {
     /// Get asset count — kept in instance storage as a cheap counter.
     pub fn get_asset_count(env: Env) -> u32 {
         Self::read_asset_count(&env)
+    }
+}
+
+/// Validates the metadata map of an asset (Issue #82).
+///
+/// The map is bounded so that a single asset cannot bloat the contract's
+/// storage: at most `MAX_METADATA_ENTRIES` entries, each holding a value of
+/// at most `MAX_METADATA_VALUE_LEN` bytes.
+///
+/// The key length is bounded to 32 characters as well, but that bound is
+/// enforced by the host - a Soroban `Symbol` can never hold more than 32
+/// characters - so an over-long key cannot reach the contract.
+pub fn validate_metadata(env: &Env, metadata: &Map<Symbol, String>) {
+    if metadata.len() > MAX_METADATA_ENTRIES {
+        panic_with_error!(env, AssetFactoryError::InvalidParameters);
+    }
+
+    for value in metadata.values().iter() {
+        if value.len() > MAX_METADATA_VALUE_LEN {
+            panic_with_error!(env, AssetFactoryError::InvalidParameters);
+        }
     }
 }
 
